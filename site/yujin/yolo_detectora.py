@@ -1,14 +1,12 @@
-from PIL import Image
-import torch  # 예시: PyTorch 기반의 YOLO 모델을 사용하는 경우
+import streamlit as st
+import tempfile  # 임시 파일을 만들기 위한 라이브러리
+import os
+from inference_sdk import InferenceHTTPClient  # [수정] 새로운 SDK import
 
-
-# --- 이 부분은 사용하는 YOLO 모델에 맞게 수정해야 합니다 ---
-# 예: 모델 파일(.pt) 로드
-# model = torch.hub.load('ultralytics/yolov5', 'custom', path='your_model.pt')
 
 def run_yolo_model(image_bytes):
     """
-    업로드된 이미지 바이트를 입력받아 YOLO 모델을 실행하고,
+    업로드된 이미지 바이트를 입력받아 Roboflow YOLO 모델을 실행하고,
     ErgonomicsAnalyzer가 요구하는 형식의 JSON 리스트를 반환합니다.
 
     Args:
@@ -16,29 +14,64 @@ def run_yolo_model(image_bytes):
 
     Returns:
         list: 감지된 객체 정보 딕셔너리의 리스트
-              (예: [{'class': 'screen', 'box': {'x': 450, ...}}, ...])
     """
 
-    # PIL 라이브러리를 사용해 바이트 데이터를 이미지로 변환
-    img = Image.open(image_bytes)
+    # --- 1. Roboflow 클라이언트 초기화 ---
+    # st.secrets를 통해 .streamlit/secrets.toml 파일에서 API 키를 안전하게 불러옵니다.
+    try:
+        # [수정] 새로운 InferenceHTTPClient 사용
+        client = InferenceHTTPClient(
+            api_url="https://serverless.roboflow.com",
+            api_key=st.secrets["#######"]  # <---roboflow api 비밀번호 키에서 확인
+        )
 
-    # --- 실제 YOLO 모델 로직 구현 ---
-    # 이 부분에 여러분의 YOLO 모델을 실행하는 코드를 작성하세요.
-    # results = model(img)
+    
+    except Exception as e:
+        st.error(f"Roboflow 클라이언트를 초기화하는 데 실패했습니다: {e}")
+        return []
 
-    # YOLO 모델의 출력 결과를 ErgonomicsAnalyzer 형식에 맞게 변환
-    # yolo_output = parse_yolo_results_to_json(results)
-    # ---------------------------------
+    # --- 2. 업로드된 이미지 데이터를 임시 파일로 저장 ---
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_image:
+        temp_image.write(image_bytes)
+        temp_image_path = temp_image.name  # 임시 파일의 전체 경로를 얻습니다.
 
-    # 지금은 시뮬레이션을 위해 예시 데이터를 반환합니다.
-    # 위 로직이 완성되면 이 예시 데이터 부분은 삭제하세요.
-    print("YOLO 모델 실행 시뮬레이션...")
-    yolo_output = [
-        {'class': 'screen', 'box': {'x': 450, 'y': 450, 'width': 750, 'height': 422}},
-        {'class': 'laptop', 'box': {'x': 1050, 'y': 650, 'width': 400, 'height': 250}},
-        {'class': 'screen support', 'box': {'x': 450, 'y': 650, 'width': 300, 'height': 150}},
-        {'class': 'keyboard', 'box': {'x': 550, 'y': 750, 'width': 450, 'height': 150}},
-        {'class': 'mouse', 'box': {'x': 950, 'y': 780, 'width': 70, 'height': 100}},
-    ]
+    print(f"이미지가 임시 파일로 저장되었습니다: {temp_image_path}")
+
+    # --- 3. Roboflow API 호출 및 결과 변환 ---
+    yolo_output = []
+    try:
+        # [수정] client.run_workflow 메소드를 사용해 분석을 실행합니다.
+        result = client.run_workflow(
+            workspace_name="yujin-qkjrt",
+            workflow_id="detect-count-and-visualize-13",
+            images={
+                "image": temp_image_path  # 임시 파일 경로를 전달
+            },
+            use_cache=True
+        )
+
+        # [중요] run_workflow의 결과(result)를 ErgonomicsAnalyzer 형식으로 변환합니다.
+        # 워크플로우 결과는 리스트 형태일 수 있으므로, 첫 번째 결과를 사용합니다.
+        if result and isinstance(result, list) and 'predictions' in result[0]:
+            for pred in result[0].get('predictions', []):
+                yolo_output.append({
+                    'class': pred['class'],
+                    'box': {
+                        'x': pred['x'],
+                        'y': pred['y'],
+                        'width': pred['width'],
+                        'height': pred['height']
+                    }
+                })
+
+        print("Roboflow 분석 결과 (변환 완료):", yolo_output)
+
+    except Exception as e:
+        st.error(f"Roboflow API를 호출하는 중 오류가 발생했습니다: {e}")
+        yolo_output = []
+    finally:
+        # --- 4. 임시 파일 삭제 ---
+        os.remove(temp_image_path)
+        print(f"임시 파일이 삭제되었습니다: {temp_image_path}")
 
     return yolo_output
