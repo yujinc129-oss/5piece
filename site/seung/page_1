@@ -1,0 +1,75 @@
+import streamlit as st
+import base64
+
+def show_opening_page():
+    @st.cache_data
+    def get_base64_of_bin_file(bin_file):
+        try:
+            with open(bin_file, 'rb') as f:
+                data = f.read()
+            return base64.b64encode(data).decode()
+        except FileNotFoundError:
+            st.error(f"'{bin_file}' 파일을 찾을 수 없습니다. 경로와 파일명을 다시 확인해주세요.")
+            return None
+
+    def set_png_as_page_bg(png_file):
+        bin_str = get_base64_of_bin_file(png_file)
+        if bin_str:
+            page_bg_img = f'''
+            <style>
+            /* === 👇 여기부터 버튼 디자인 코드입니다 👇 === */
+            div.stButton > button {{
+                background-color: #FFD1DC;
+                color: #4A4A4A;
+                border-radius: 12px;
+                border: 2px solid #FFC0CB;
+                padding: 12px 30px;
+                font-size: 1.2em;
+                font-weight: bold;
+                box-shadow: 2px 2px 8px rgba(0,0,0,0.2);
+                transition: all 0.2s ease-in-out;
+            }}
+            div.stButton > button:hover {{
+                background-color: #FFC0CB;
+                color: white;
+                border-color: #FFB6C1;
+                transform: translateY(-2px);
+            }}
+            div.stButton > button:active {{
+                transform: translateY(0);
+            }}
+            /* === 👆 여기까지 버튼 디자인 코드입니다 👆 === */
+
+            .stApp {{
+                background-image: linear-gradient(rgba(0,0,0,0.5), rgba(0,0,0,0.5)), url("data:image/png;base64,{bin_str}");
+                background-size: cover;
+                background-position: center;
+            }}
+            .stApp > header {{
+                background-color: transparent;
+            }}
+            </style>
+            '''
+            st.markdown(page_bg_img, unsafe_allow_html=True)
+
+    # 💡💡💡 파일 경로의 역슬래시(\)를 슬래시(/)로 수정했습니다. 💡💡💡
+    image_path = 'C:/workspace/lab_llm/project/곰돌이.png'
+    set_png_as_page_bg(image_path)
+
+    st.markdown("""
+        <div style="display: flex; justify-content: center; align-items: center; height: 80vh; flex-direction: column;">
+            <h1 style="color: white; text-align: center; font-size: 4em;">5Piece</h1>
+            <p style="color: white; text-align: center; font-size: 1.5em; margin-top: 20px;">
+                이제 전문가의 도움 없이 책상 사진 한 장만으로 목과 어깨, 손목 통증을 유발하는 잘못된 자세와 작업 환경을 진단받아 보세요. <br>5Piece가 당신의 몸에 꼭 맞는 최적의 책상 배치를 찾아, 매일 더 편안하고 건강한 하루를 선물해 드릴게요.
+            </p>
+        </div>
+    """, unsafe_allow_html=True)
+
+    _, col2, _ = st.columns([1.5, 1, 1.5])
+    with col2:
+        if st.button("분석 시작하기", use_container_width=True):
+            st.toast("버튼 클릭! 다음 페이지로 이동합니다.")
+
+
+if __name__ == "__main__":
+    show_opening_page()
