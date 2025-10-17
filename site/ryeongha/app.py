@@ -3,7 +3,7 @@ import time
 from PIL import Image, ImageDraw
 from yolo_detector import run_yolo_model
 from ergonomics_analyzer import ErgonomicsAnalyzer
-from components.screen_selector import select_main_screen
+from steps.screen_selector import select_main_screen
 
 # --------------------------------------------------------------------------
 # Streamlit UI 구성
