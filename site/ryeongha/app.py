@@ -3,6 +3,7 @@ import time
 from PIL import Image, ImageDraw
 from yolo_detector import run_yolo_model
 from ergonomics_analyzer import ErgonomicsAnalyzer
+from components.screen_selector import select_main_screen
 
 # --------------------------------------------------------------------------
 # Streamlit UI 구성
@@ -66,50 +67,42 @@ if uploaded_file:
     st.image(image_with_boxes, caption="감지된 스크린 위치", use_container_width=True)
     st.info("이미지에서 빨간 박스를 참고하여 메인 스크린을 선택하세요.")
 
-    # --- 4️⃣ 스크린 선택 ---
-    screen_options = {f"{obj['id']} ({obj['class']})": obj['id'] for obj in screen_objects}
-    selected_option = st.selectbox("🖥️ 메인 스크린 선택", list(screen_options.keys()))
-    selected_id = screen_options[selected_option]
+    # --- 4️⃣ 스크린 선택 및 인치 입력 ---
+    analyzer = ErgonomicsAnalyzer(
+        yolo_output,
+        {"user_height_cm": user_height, "gender": gender, "handedness": handedness}
+    )
 
-    # --- 5️⃣ 인치 입력 ---
-    main_screen_inch = st.number_input("메인 스크린 인치 입력 (예: 27)", min_value=10.0, max_value=60.0, step=0.5)
+    selection = select_main_screen(analyzer)
 
-    # --- 6️⃣ 분석 시작 버튼 ---
-    if st.button("✅ 종합 분석 시작"):
-        with st.spinner("선택된 스크린을 기준으로 자세를 분석 중입니다..."):
-            time.sleep(1)
+    # --- 5️⃣ 분석 실행 ---
+    if selection:
+        if st.button("✅ 종합 분석 시작"):
+            with st.spinner("선택된 스크린을 기준으로 자세를 분석 중입니다..."):
+                time.sleep(1)
+                analyzer.set_main_screen_by_id(selection["screen_id"], selection["inch"])
+                report = analyzer.run_all_analyses()
 
-            user_inputs = {
-                "user_height_cm": user_height,
-                "gender": gender,
-                "handedness": handedness,
-            }
+            # --- 6️⃣ 결과 출력 ---
+            st.success("🎯 종합 분석이 완료되었습니다!")
 
-            analyzer = ErgonomicsAnalyzer(yolo_output, user_inputs)
-            analyzer.set_main_screen_by_id(selected_id, main_screen_inch)
-            report = analyzer.run_all_analyses()
+            solution_text = f"""
+            ### 🧠 종합 분석 결과  
+            **선택된 메인 스크린:** {selection["screen_label"]}  
+            **크기:** {selection["inch"]} 인치  
 
-        # --- 7️⃣ 결과 출력 ---
-        st.success("🎯 종합 분석이 완료되었습니다!")
+            주요 문제점과 개선 방향은 아래와 같습니다.
+            (이 부분은 실제 GPT 분석 결과로 대체될 수 있습니다.)
 
-        solution_text = f"""
-        ### 🧠 종합 분석 결과  
-        **선택된 메인 스크린:** {selected_option}  
-        **크기:** {main_screen_inch} 인치  
+            - **문제점 1:** 모니터 높이가 눈높이보다 낮음  
+              👉 받침대 또는 높이 조절 스탠드 권장  
+            - **문제점 2:** 조명 반사로 인한 시야 피로  
+              👉 간접 조명 사용 및 모니터 각도 조정 권장
+            """
 
-        주요 문제점과 개선 방향은 아래와 같습니다.
-        (이 부분은 실제 GPT 분석 결과로 대체될 수 있습니다.)
-
-        - **문제점 1:** 모니터 높이가 눈높이보다 낮음  
-          👉 받침대 또는 높이 조절 스탠드 권장  
-        - **문제점 2:** 조명 반사로 인한 시야 피로  
-          👉 간접 조명 사용 및 모니터 각도 조정 권장
-        """
-
-        st.markdown(solution_text)
-
-        with st.expander("📋 자세한 분석 리포트 보기 (JSON)"):
-            st.json(report)
+            st.markdown(solution_text)
+            with st.expander("📋 자세한 분석 리포트 보기 (JSON)"):
+                st.json(report)
 
 else:
     st.info("📸 책상 사진을 업로드하면 인체공학 분석을 시작할 수 있습니다.")
