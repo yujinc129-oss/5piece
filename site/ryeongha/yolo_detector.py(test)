@@ -7,23 +7,92 @@ from inference_sdk import InferenceHTTPClient  # [수정] 새로운 SDK import
 # 임시 테스트용 함수
 from PIL import Image
 
+# Roboflow SDK (없을 수도 있으므로 try-except)
+try:
+    from inference_sdk import InferenceHTTPClient
+except ImportError:
+    InferenceHTTPClient = None
+
+
 def run_yolo_model(image_bytes):
     """
-    테스트용: Roboflow 연결 없이 샘플 YOLO 결과를 반환
+    Roboflow API 연결 기반 YOLO 감지 함수 (API 키 없을 시 테스트 모드 실행)
     """
 
-    print("⚙️ [테스트모드] YOLO 모델 실행 시뮬레이션 중...")
+    # ✅ [수정된 부분] secrets.toml이 없어도 통과되도록 예외처리
+    try:
+        api_key = (
+            st.secrets.get("general", {}).get("roboflow_api_key", None)
+            if hasattr(st, "secrets")
+            else None
+        )
+    except Exception:
+        api_key = None
 
-    # 예시로 몇 개의 객체를 감지한 것처럼 반환
-    yolo_output = [
+    workspace_name = "yujin-qkjrt"          # Roboflow 워크스페이스 이름
+    workflow_id = "detect-count-and-visualize-13"  # Roboflow 워크플로 ID
+
+    # ✅ API 키가 없거나 SDK가 설치 안되어 있으면 테스트모드
+    if not api_key or InferenceHTTPClient is None:
+        st.warning("⚠️ Roboflow API 키가 없어 테스트모드로 실행됩니다.")
+        return _sample_yolo_output()
+
+    try:
+        client = InferenceHTTPClient(
+            api_url="https://serverless.roboflow.com",
+            api_key=api_key
+        )
+    except Exception as e:
+        st.error(f"Roboflow 클라이언트 초기화 실패: {e}")
+        return _sample_yolo_output()
+
+    # 임시 파일 저장
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+        tmp.write(image_bytes.read())
+        tmp_path = tmp.name
+
+    try:
+        result = client.run_workflow(
+            workspace_name=workspace_name,
+            workflow_id=workflow_id,
+            images={"image": tmp_path},
+            use_cache=True
+        )
+        yolo_output = []
+        if isinstance(result, list) and "predictions" in result[0]:
+            for pred in result[0]["predictions"]:
+                yolo_output.append({
+                    "class": pred["class"],
+                    "box": {
+                        "x": pred["x"],
+                        "y": pred["y"],
+                        "width": pred["width"],
+                        "height": pred["height"]
+                    }
+                })
+        else:
+            st.warning("⚠️ Roboflow 결과를 분석할 수 없습니다. 테스트 데이터로 대체합니다.")
+            yolo_output = _sample_yolo_output()
+
+        return yolo_output
+
+    except Exception as e:
+        st.error(f"Roboflow API 호출 중 오류 발생: {e}")
+        return _sample_yolo_output()
+    finally:
+        os.remove(tmp_path)
+
+
+def _sample_yolo_output():
+    """Roboflow API 연결이 없을 때 사용할 테스트 데이터"""
+    print("⚙️ [테스트모드] YOLO 감지 결과를 임시로 반환합니다.")
+    return [
         {'class': 'screen', 'box': {'x': 450, 'y': 450, 'width': 750, 'height': 422}},
         {'class': 'laptop', 'box': {'x': 1050, 'y': 650, 'width': 400, 'height': 250}},
         {'class': 'keyboard', 'box': {'x': 550, 'y': 750, 'width': 450, 'height': 150}},
         {'class': 'mouse', 'box': {'x': 950, 'y': 780, 'width': 70, 'height': 100}},
         {'class': 'desk lamp', 'box': {'x': 300, 'y': 400, 'width': 120, 'height': 200}},
     ]
-
-    return yolo_output
 
 
 
