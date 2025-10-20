@@ -1,1 +1,260 @@
+# -*- coding: utf-8 -*-
+"""
+인체공학적 책상 개선 가이드 (Streamlit)
+
+- 메타데이터 기반 페이지 로딩
+- OpenAI GPT 연동 (환경변수 OPENAI_API_KEY 필요)
+- 실행: streamlit run app.py
+"""
+
+import os
+import time
+import logging
+import json
+import importlib
+from typing import Optional, Tuple, Dict
+
+import streamlit as st
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# ---------------------------
+# 설정 및 로깅
+# ---------------------------
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Streamlit secrets를 os.environ로 복사 (Streamlit 실행/배포 환경에서 시크릿이 st.secrets에 있을 수 있음)
+try:
+    # print('#1', st.secrets.get("OPENAI_API_KEY")) # 키를 가져왔는지 확인하는 코드
+    # print('#2', os.environ["OPENAI_API_KEY"]) # 키를 가져왔는지 확인하는 코드
+    if "OPENAI_API_KEY" not in os.environ and st.secrets.get("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+except Exception:
+    # 안전하게 무시 (예: st.secrets가 없거나 접근 불가한 환경)
+    pass
+
+# ---------------------------
+# OpenAI 안전 초기화 유틸
+# ---------------------------
+def make_openai_client() -> Optional[OpenAI]:
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        logger.info("OPENAI_API_KEY가 설정되어 있지 않습니다.")
+        return None
+    try:
+        return OpenAI(api_key=key)
+    except Exception:
+        logger.exception("OpenAI 클라이언트 생성 실패")
+        return None
+
+def api_key_status_text() -> str:
+    key = os.environ.get("OPENAI_API_KEY")
+    return f"✅ 설정됨 (키 시작: {key[:6]}...)" if key else "⚠️ 설정되지 않음!"
+
+def extract_text_from_response(resp) -> str:
+    try:
+        # new OpenAI client: resp may be dict-like or object with 'choices' etc.
+        if hasattr(resp, "choices") and len(resp.choices) > 0:
+            choice = resp.choices[0]
+            if hasattr(choice, "message") and hasattr(choice.message, "content"):
+                return choice.message.content.strip()
+            if hasattr(choice, "text"):
+                return choice.text.strip()
+            if isinstance(choice, dict):
+                msg = choice.get("message") or {}
+                if isinstance(msg, dict) and msg.get("content"):
+                    return msg["content"].strip()
+        if isinstance(resp, dict):
+            choices = resp.get("choices", [])
+            if choices:
+                c0 = choices[0]
+                if isinstance(c0, dict):
+                    msg = c0.get("message") or {}
+                    content = msg.get("content") or c0.get("text")
+                    if content:
+                        return content.strip()
+    except Exception:
+        logger.exception("응답 파싱 중 오류")
+    return "응답을 파싱할 수 없습니다."
+
+# 전역 클라이언트 (런타임에 재초기화 가능)
+client: Optional[OpenAI] = make_openai_client()
+
+# ---------------------------
+# 데이터 클래스 및 분석 로직 (원본 유지)
+# ---------------------------
+class UserAnalysis:
+    def __init__(self, monitor_size: int = 24, height_cm: int = 170):
+        self.monitor_size = monitor_size
+        self.height_cm = height_cm
+
+    def to_dict(self) -> Dict:
+        return {"monitor_size": self.monitor_size, "height_cm": self.height_cm}
+
+def mock_run_analysis_pipeline(user_analysis: UserAnalysis) -> Tuple[str, Dict]:
+    monitor_size = user_analysis.monitor_size
+    height_cm = user_analysis.height_cm
+    if monitor_size >= 27 and height_cm >= 175:
+        result = "✅ 현재 책상 구성은 대체로 인체공학적 기준에 적합합니다."
+    else:
+        result = "⚠️ 책상 높이 또는 모니터 크기 조정이 필요할 수 있습니다."
+    report = {
+        "monitor_size": monitor_size,
+        "height_cm": height_cm,
+        "recommendation": result,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    return result, report
+
+# ---------------------------
+# OpenAI 연동 함수 (통일된 최신 client.chat.create 사용)
+# ---------------------------
+def get_gpt_recommendation(report: Dict) -> str:
+    global client
+    if not client:
+        client = make_openai_client()
+    if not client:
+        return "⚠️ OpenAI 클라이언트가 초기화되지 않았습니다. OPENAI_API_KEY를 확인하세요."
+
+    prompt_text = (
+        f"사용자의 책상 환경 분석 결과입니다:\n"
+        f"- 모니터 크기: {report.get('monitor_size')} 인치\n"
+        f"- 사용자 신장: {report.get('height_cm')} cm\n"
+        f"- 1차 진단: {report.get('recommendation')}\n\n"
+        "당신은 세계 최고의 인체공학 전문가입니다. 위 정보를 바탕으로 사용자에게 매우 구체적이고 실용적인 책상 환경 개선 방안을 한국어로 "
+        "번호 목록 형식으로 작성해 주세요. 다음을 반드시 포함하세요: 1) 현재 상황 진단 2) 모니터 설정 가이드 3) 책상 및 의자 높이 조언 4) 추가적인 인체공학 팁."
+    )
+
+    try:
+        # 최신 OpenAI 클라이언트: client.chat.create(...)
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a world-class ergonomics expert, answer in Korean."},
+                {"role": "user", "content": prompt_text}
+            ],
+            temperature=0.7,
+            max_tokens=600,
+            timeout=30
+        )
+        return extract_text_from_response(response)
+    except Exception as e:
+        logger.exception("GPT 호출 실패")
+        return f"GPT API 호출 중 오류가 발생했습니다: {type(e).__name__}: {e}"
+
+# ---------------------------
+# 페이지 흐름 제어 헬퍼
+# ---------------------------
+def go_to_page(page_num: int):
+    st.session_state['current_page'] = page_num
+    st.rerun()
+
+def handle_retry():
+    st.session_state['current_page'] = 1
+    st.session_state['user_analysis'] = UserAnalysis()
+    st.session_state['analysis_result'] = None
+    st.session_state['detailed_report'] = None
+    st.rerun()
+
+# ---------------------------
+# Streamlit 초기 설정 및 메인 루프
+# ---------------------------
+st.set_page_config(page_title="인체공학적 책상 개선 가이드", page_icon="🦾", layout="centered")
+st.title("🦾 인체공학적 책상 개선 가이드 서비스")
+st.markdown("---")
+
+# 세션 초기화
+if 'current_page' not in st.session_state:
+    st.session_state['current_page'] = 1
+if 'user_analysis' not in st.session_state:
+    st.session_state['user_analysis'] = UserAnalysis()
+if 'analysis_result' not in st.session_state:
+    st.session_state['analysis_result'] = None
+if 'detailed_report' not in st.session_state:
+    st.session_state['detailed_report'] = None
+
+# 메타데이터 기반 페이지 실행
+def display_page():
+    page_id = st.session_state['current_page']
+    meta_path = os.path.join("pages", "metadata.json")
+    if not os.path.exists(meta_path):
+        st.error("pages/metadata.json 파일을 찾을 수 없습니다. pages 폴더와 metadata.json을 확인하세요.")
+        return
+    try:
+        with open(meta_path, encoding="utf-8") as f:
+            metadata = json.load(f)
+        page_info = next((p for p in metadata.get("pages", []) if p.get("id") == page_id), None)
+        if page_info:
+            module_name = page_info.get("module")
+            function_name = page_info.get("function")
+            try:
+                module = importlib.import_module(f"pages.{module_name}")
+                func = getattr(module, function_name)
+                # 페이지 UI 실행
+                func()
+            except Exception as e:
+                logger.exception("페이지 실행 실패")
+                st.error(f"페이지 실행 실패: {e}")
+    except Exception as e:
+        logger.exception("metadata.json 읽기 실패")
+        st.error(f"🚨 페이지 로딩 중 오류 발생: {e}")
+
+# 페이지별 네비게이션 버튼 (app.py가 전역 흐름 제어)
+page = st.session_state['current_page']
+st.markdown("---")
+
+if page == 1:
+    if st.button("Start Analysis (P2로 이동)", key="start_p1", use_container_width=True):
+        go_to_page(2)
+elif page == 2:
+    cols = st.columns(3)
+    with cols[0]:
+        if st.button("< Back (P1로 이동)", key="back_p2", use_container_width=True):
+            go_to_page(1)
+    with cols[2]:
+        if st.button("Next > (P3로 이동)", key="next_p2", use_container_width=True):
+            go_to_page(3)
+elif page == 3:
+    cols = st.columns(3)
+    with cols[0]:
+        if st.button("< Back (P2로 이동)", key="back_p3", use_container_width=True):
+            go_to_page(2)
+    with cols[2]:
+        if st.button("Analyze Desk > (P4로 이동)", key="next_p3", use_container_width=True):
+            go_to_page(4)
+elif page == 4:
+    # P4는 분석 진행 페이지 (간단 실행)
+    st.header("Page 4: ⏱️ 분석 진행 중...")
+    st.info("분석 파이프라인 실행 중입니다. 완료 시 P5로 자동 전환됩니다.")
+    with st.spinner("분석 중..."):
+        time.sleep(0.8)
+        final_solution_text, analysis_report = mock_run_analysis_pipeline(st.session_state['user_analysis'])
+        st.session_state['analysis_result'] = final_solution_text
+        st.session_state['detailed_report'] = analysis_report
+    st.success("기본 분석이 완료되었습니다!")
+    time.sleep(0.3)
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("생성: AI 권장사항 받기 (P5로 이동)", key="gpt_generate"):
+            with st.spinner("AI 권장사항 생성 중..."):
+                gpt_text = get_gpt_recommendation(st.session_state['detailed_report'])
+                st.session_state['analysis_result'] = gpt_text
+            go_to_page(5)
+    with col2:
+        if st.button("건너뛰기: 결과만 보기 (P5로 이동)", key="skip_gpt"):
+            go_to_page(5)
+elif page == 5:
+    final_result = st.session_state.get('analysis_result', "분석 결과를 불러올 수 없습니다.")
+    detailed_report = st.session_state.get('detailed_report', {"error": "No report found"})
+    st.subheader("📊 분석 결과")
+    st.success(final_result)
+    st.markdown("### 📋 상세 리포트")
+    st.json(detailed_report)
+    if st.button("Retry Service (P1로 초기화)", key="retry_p5", use_container_width=True):
+        handle_retry()
+
+display_page()
 
