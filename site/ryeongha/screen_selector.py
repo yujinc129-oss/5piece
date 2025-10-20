@@ -1,4 +1,4 @@
-# components/screen_selector.py
+# steps/screen_selector.py
 import streamlit as st
 
 def select_main_screen(analyzer):
