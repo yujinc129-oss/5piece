@@ -1,0 +1,376 @@
+# -*- coding: utf-8 -*-
+"""
+Streamlit app (수정본)
+- Streamlit 버전 차이(st.rerun / st.experimental_rerun) 안전 처리 추가
+- image_visualizer_colab_ver 동작을 로컬/pycharm 환경에서 동작하도록 정리
+- 기존 기능 유지(메타데이터 기반 페이지 로드, 분석 파이프라인, GPT 연동)
+"""
+import os
+import time
+import logging
+import json
+import importlib
+from typing import Optional
+import streamlit as st
+from dotenv import load_dotenv
+
+# app.py 최상단에 추가 (기존 import들 바로 아래)
+import os, sys
+
+# 프로젝트 구조상 app.py가 있는 디렉토리가 패키지 루트이므로 아래 경로 추가는 대개 불필요.
+# 그래도 안전하게 현재 파일(=app.py)이 있는 디렉토리를 sys.path에 넣습니다.
+APP_ROOT = os.path.abspath(os.path.dirname(__file__))
+if APP_ROOT not in sys.path:
+    sys.path.insert(0, APP_ROOT)
+
+# ergonomics/ergonomics_analyzer.py에서 클래스를 직접 import
+try:
+    from ergonomics.ergonomics_analyzer import ErgonomicsAnalyzer
+except Exception as e:
+    # 임포트 실패 시 개발용 메시지 노출 (콘솔/Streamlit에서 확인 가능)
+    import logging
+    logging.exception("ergonomics 모듈 임포트 실패: %s", e)
+    ErgonomicsAnalyzer = None
+
+# NOTE: OpenAI 라이브러리는 선택적입니다. 환경에서 사용하지 않을 경우 None 처리됩니다.
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Streamlit secrets -> os.environ (가능하면)
+try:
+    if "OPENAI_API_KEY" not in os.environ and st.secrets.get("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+except Exception:
+    pass
+
+# ------------------------
+# 안전한 rerun 헬퍼 (Streamlit 버전 차이 처리)
+# ------------------------
+def _safe_rerun():
+    """Streamlit 버전 차이를 흡수하는 안전한 rerun 호출."""
+    if hasattr(st, "rerun") and callable(getattr(st, "rerun")):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun") and callable(getattr(st, "experimental_rerun")):
+        st.experimental_rerun()
+    else:
+        raise RuntimeError("Streamlit rerun 기능을 사용할 수 없습니다. st.rerun 또는 st.experimental_rerun이 필요합니다.")
+
+# ------------------------
+# OpenAI 유틸리티
+# ------------------------
+def make_openai_client() -> Optional[OpenAI]:
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key or OpenAI is None:
+        logger.info("OpenAI API 키가 없거나 openai 라이브러리를 찾을 수 없습니다.")
+        return None
+    try:
+        return OpenAI(api_key=key)
+    except Exception:
+        logger.exception("OpenAI 클라이언트 생성 실패")
+        return None
+
+def extract_text_from_response(resp) -> str:
+    try:
+        if hasattr(resp, "choices") and len(resp.choices) > 0:
+            ch = resp.choices[0]
+            if hasattr(ch, "message") and hasattr(ch.message, "content"):
+                return ch.message.content.strip()
+            if hasattr(ch, "text"):
+                return ch.text.strip()
+        if isinstance(resp, dict):
+            choices = resp.get("choices")
+            if choices and isinstance(choices, list):
+                first = choices[0]
+                if isinstance(first, dict):
+                    return first.get("message", {}).get("content", "") or first.get("text", "")
+    except Exception:
+        logger.exception("응답 파싱 중 오류")
+    return "응답을 파싱할 수 없습니다."
+
+# 전역 client (지연 생성)
+client: Optional[OpenAI] = None
+
+# ------------------------
+# GPT 연동 함수
+# ------------------------
+def get_gpt_recommendation(report: list) -> str:
+    global client
+    if client is None:
+        client = make_openai_client()
+    if not client:
+        return "⚠️ OpenAI 클라이언트가 초기화되지 않았습니다. OPENAI_API_KEY를 확인하세요."
+    report_str = json.dumps(report, indent=2, ensure_ascii=False)
+    prompt_text = (
+        "다음은 사용자의 책상 환경에 대한 인체공학 분석 결과(JSON 형식)입니다:\n"
+        f"```json\n{report_str}\n```\n\n"
+        "당신은 세계 최고의 인체공학 전문가입니다. 위 분석 결과를 해석하여, 사용자에게 매우 구체적이고 실용적인 책상 환경 개선 방안을 한국어로 친절하게 설명해주세요.\n"
+        "번호 목록 형식을 사용하여 다음 내용을 반드시 포함하여 조언해주세요:\n"
+        "1. **종합 진단**: 현재 상황에 대한 긍정적인 점과 가장 시급하게 개선해야 할 점을 요약해주세요.\n"
+        "2. **상세 개선 방안**: 분석 결과에서 'severity'가 'High' 또는 'Moderate'인 문제점들을 중심으로, 각각에 대한 구체적인 해결책을 제시해주세요.\n"
+        "3. **추가적인 팁**: 분석 리포트에 나타나지 않았더라도, 건강한 컴퓨터 작업을 위한 일반적인 인체공학 팁(스트레칭, 휴식 시간)을 2-3가지 제안해주세요.\n"
+    )
+    try:
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a world-class ergonomics expert providing advice in Korean."},
+                {"role": "user", "content": prompt_text}
+            ],
+            temperature=0.7,
+            max_tokens=1024,
+            timeout=45
+        )
+        return extract_text_from_response(response)
+    except Exception as e:
+        logger.exception("GPT 호출 실패")
+        return f"GPT API 호출 중 오류가 발생했습니다: {type(e).__name__}: {e}"
+
+# ------------------------
+# Helper: session에서 사용자 입력 복원
+# ------------------------
+def normalize_user_inputs() -> dict:
+    ui = {}
+    sess = st.session_state
+    candidate = sess.get("user_inputs") or sess.get("user_info") or {}
+    if "user_height_cm" in candidate:
+        ui["user_height_cm"] = candidate["user_height_cm"]
+    elif "height" in candidate:
+        ui["user_height_cm"] = candidate["height"]
+    elif "키" in candidate:
+        ui["user_height_cm"] = candidate["키"]
+    gender = candidate.get("gender") or candidate.get("성별")
+    if isinstance(gender, str):
+        g = gender.lower()
+        if "남" in g or "male" in g:
+            ui["gender"] = "male"
+        elif "여" in g or "female" in g:
+            ui["gender"] = "female"
+        else:
+            ui["gender"] = gender
+    handed = candidate.get("handedness") or candidate.get("dominant_hand") or candidate.get("주 사용 손")
+    if isinstance(handed, str):
+        h = handed.lower()
+        if "왼" in h or "left" in h:
+            ui["handedness"] = "left"
+        else:
+            ui["handedness"] = "right"
+    return ui
+
+# ------------------------
+# Streamlit 앱 메인 및 네비게이션
+# ------------------------
+st.set_page_config(page_title="인체공학적 책상 개선 가이드", page_icon="🦾", layout="centered")
+st.title("🦾 인체공학적 책상 개선 가이드 서비스")
+st.markdown("---")
+
+if 'current_page' not in st.session_state:
+    st.session_state['current_page'] = 1
+
+def go_to_page(page_num: int):
+    st.session_state['current_page'] = page_num
+    _safe_rerun()
+
+def handle_retry():
+    keys_to_reset = [
+        'current_page', 'user_analysis', 'analysis_result', 'detailed_report',
+        'yolo_output', 'user_inputs', 'selected_screen_id', 'selected_screen_inch', 'image_width_px',
+        'workflow_result', 'main_screen', 'monitor_inch', 'main_screen'
+    ]
+    for key in keys_to_reset:
+        if key in st.session_state:
+            del st.session_state[key]
+    st.session_state['current_page'] = 1
+    _safe_rerun()
+
+def display_page():
+    page_id = st.session_state.get('current_page', 1)
+    pages_dir = "pages"
+    meta_path = os.path.join(pages_dir, "metadata.json")
+    if not os.path.exists(pages_dir) or not os.path.exists(meta_path):
+        st.warning("pages 디렉토리 또는 pages/metadata.json 파일을 찾을 수 없습니다.")
+        return
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        page_info = next((p for p in metadata.get("pages", []) if p.get("id") == page_id), None)
+        if page_info:
+            module = importlib.import_module(f"pages.{page_info['module']}")
+            func = getattr(module, page_info['function'])
+            func()
+    except Exception as e:
+        logger.exception("페이지 로딩 실패")
+        st.error(f"페이지 로딩 중 오류 발생: {e}")
+
+display_page()
+st.markdown("---")
+
+page = st.session_state.get('current_page', 1)
+
+if page == 1:
+    if st.button("Start Analysis", key="start_p1", use_container_width=True):
+        go_to_page(2)
+elif page == 2:
+    cols = st.columns(3)
+    with cols[0]:
+        if st.button("< Back", key="back_p2", use_container_width=True):
+            go_to_page(1)
+    with cols[2]:
+        if st.button("Next >", key="next_p3", use_container_width=True):
+            go_to_page(3)
+elif page == 3:
+    cols = st.columns(3)
+    with cols[0]:
+        if st.button("< Back", key="back_p3", use_container_width=True):
+            go_to_page(2)
+    with cols[2]:
+        if st.button("Get My Ergonomic Report", key="next_p4", use_container_width=True):
+            go_to_page(4)
+elif page == 4:
+    st.header("⏱️ 분석 중입니다...")
+    st.info("AI가 당신의 책상 환경을 정밀 분석하고 맞춤형 리포트를 생성하고 있습니다.")
+    try:
+        workflow_result = st.session_state.get('workflow_result', [{}])
+        workflow_item = workflow_result[0] if isinstance(workflow_result, list) and len(workflow_result) > 0 else workflow_result
+        main_screen_raw = st.session_state.get('main_screen')
+        main_screen_inch = st.session_state.get('monitor_inch')
+        user_inputs = normalize_user_inputs()
+        if not workflow_item or not main_screen_raw or not main_screen_inch:
+            st.error("분석에 필요한 이미지 또는 메인 스크린 정보가 부족합니다. 2단계로 돌아가 다시 시도해주세요.")
+            if st.button("돌아가기"):
+                handle_retry()
+            st.stop()
+        raw_detections = workflow_item.get("predictions", {}).get("predictions", [])
+        image_width = workflow_item.get("image", {}).get("width", 1280)
+        yolo_results = []
+        for det in raw_detections:
+            yolo_results.append({
+                "class": det.get("class"),
+                "confidence": det.get("confidence"),
+                "box": {"x": det.get("x"), "y": det.get("y"), "width": det.get("width"), "height": det.get("height")}
+            })
+        main_screen_id = None
+        for i, det in enumerate(yolo_results):
+            if (det['box']['x'] == main_screen_raw.get('x') and
+                    det['box']['y'] == main_screen_raw.get('y') and
+                    det['class'] == main_screen_raw.get('class')):
+                det['id'] = f"screen_{i}"
+                main_screen_id = f"screen_{i}"
+                break
+        if not main_screen_id:
+            for i, det in enumerate(yolo_results):
+                if det.get("class") in ["screen", "monitor", "laptop"]:
+                    det['id'] = f"screen_{i}"
+                    main_screen_id = f"screen_{i}"
+                    break
+        if ErgonomicsAnalyzer is None:
+            st.error(
+                "애플리케이션에서 ErgonomicsAnalyzer 클래스를 찾을 수 없습니다. ergonomics/ergonomics_analyzer.py 경로와 __init__.py를 확인하세요.")
+            st.stop()
+        # 그 다음 바로 사용
+        analyzer = ErgonomicsAnalyzer(yolo_results, user_inputs or {}, image_width)
+        analyzer = ErgonomicsAnalyzer(yolo_results, user_inputs or {}, image_width)
+        analyzer.set_main_screen_by_id(main_screen_id, str(main_screen_inch))
+        analysis_report = analyzer.run_all_analyses()
+        st.session_state['detailed_report'] = analysis_report
+        gpt_text = get_gpt_recommendation(analysis_report)
+        st.session_state['analysis_result'] = gpt_text
+        st.success("분석 및 리포트 생성이 완료되었습니다!")
+        time.sleep(0.6)
+        go_to_page(5)
+    except Exception as e:
+        logger.exception("분석 파이프라인 오류")
+        st.error(f"분석 중 오류가 발생했습니다: {e}")
+        if st.button("처음으로 돌아가기", on_click=handle_retry):
+            pass
+        st.stop()
+elif page == 5:
+    st.subheader("📊 당신을 위한 AI 인체공학 분석 리포트")
+    final_result = st.session_state.get('analysis_result', "분석 결과를 불러올 수 없습니다.")
+    st.markdown(final_result)
+    st.markdown("---")
+    try:
+        import base64
+        from importlib import import_module
+        image_visualizer = import_module("image_visualizer")
+    except Exception:
+        image_visualizer = None
+        logger.exception("image_visualizer 모듈 로드 실패")
+    workflow_list = st.session_state.get('workflow_result', None)
+    workflow_item = workflow_list[0] if isinstance(workflow_list, list) and len(workflow_list) > 0 else workflow_list
+    output_b64 = None
+    if isinstance(workflow_item, dict):
+        output_b64 = workflow_item.get("output_image") or workflow_item.get("image", {}).get("output_image")
+    image_bytes = None
+    if output_b64:
+        try:
+            image_bytes = base64.b64decode(output_b64)
+        except Exception:
+            image_bytes = None
+    detailed_report = st.session_state.get('detailed_report', [])
+    raw_detections = workflow_item.get("predictions", {}).get("predictions", []) if isinstance(workflow_item, dict) else []
+    image_width = workflow_item.get("image", {}).get("width", 1280) if isinstance(workflow_item, dict) else 1280
+    yolo_results = []
+    for det in raw_detections:
+        yolo_results.append({
+            "class": det.get("class"),
+            "confidence": det.get("confidence"),
+            "box": {"x": det.get("x"), "y": det.get("y"), "width": det.get("width"), "height": det.get("height")}
+        })
+    main_screen_raw = st.session_state.get("main_screen")
+    main_screen_id = None
+    for i, det in enumerate(yolo_results):
+        if main_screen_raw and det['box']['x'] == main_screen_raw.get('x') and det['box']['y'] == main_screen_raw.get('y') and det['class'] == main_screen_raw.get('class'):
+            det['id'] = f"screen_{i}"
+            main_screen_id = f"screen_{i}"
+            break
+    if not main_screen_id and len(yolo_results) > 0:
+        for i, det in enumerate(yolo_results):
+            if det.get("class") in ["screen", "monitor", "laptop"]:
+                det['id'] = f"screen_{i}"
+                main_screen_id = f"screen_{i}"
+                break
+    user_inputs = normalize_user_inputs()
+    monitor_inch = st.session_state.get("monitor_inch", st.session_state.get("selected_screen_inch", None))
+    analyzer = None
+    try:
+        ErgonomicsAnalyzer = globals().get("ErgonomicsAnalyzer")
+        if ErgonomicsAnalyzer:
+            analyzer = ErgonomicsAnalyzer(yolo_results, user_inputs or {}, image_width)
+            if main_screen_id and monitor_inch:
+                analyzer.set_main_screen_by_id(main_screen_id, str(monitor_inch))
+    except Exception as e:
+        logger.exception("Analyzer reconstruction failed: %s", e)
+        analyzer = None
+    if image_bytes and image_visualizer and analyzer and detailed_report:
+        try:
+            vis_img = image_visualizer.draw_feedback_on_image(image_bytes, detailed_report, analyzer)
+            st.image(vis_img, caption="🔍 시각화된 권장 변경 사항", use_column_width=True)
+        except Exception as e:
+            logger.exception("이미지 시각화 중 오류: %s", e)
+            st.warning("이미지 시각화를 생성할 수 없습니다. (내부 처리 오류)")
+    else:
+        if not image_bytes:
+            st.info("시각화에 사용할 이미지 데이터가 없습니다.")
+        elif not image_visualizer:
+            st.info("시각화 모듈(image_visualizer)을 로드하지 못했습니다.")
+        elif not analyzer:
+            st.info("시각화용 분석기(Analyzer)를 재구성하지 못했습니다.")
+        elif not detailed_report:
+            st.info("시각화에 필요한 상세 분석 리포트가 없습니다.")
+    st.subheader("📋 상세 분석 데이터")
+    detailed_report = st.session_state.get('detailed_report', [])
+    if not detailed_report:
+        st.info("상세 분석 데이터가 없습니다.")
+    else:
+        for item in detailed_report:
+            st.markdown(f"**항목: {item.get('problem_id', 'UNKNOWN')}**")
+            st.markdown(f"**진단: {item.get('severity', 'Low')}**")
+            st.markdown(f"세부 내용: {json.dumps(item.get('details', {}), ensure_ascii=False)}")
+    if st.button("다시 분석하기", key="retry_p5", use_container_width=True):
+        handle_retry()
