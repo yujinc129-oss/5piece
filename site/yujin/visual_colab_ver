@@ -1,0 +1,484 @@
+# -----------------------------------------------------------------
+# Colab 단일 셀 통합 코드
+# 이 셀 하나만 실행하면 모든 준비와 테스트가 완료됩니다.
+# -----------------------------------------------------------------
+import math
+import json
+import re
+from PIL import Image, ImageDraw, ImageFont
+from io import BytesIO
+import requests
+import os
+import matplotlib.pyplot as plt
+
+# --------------------------------------------------------------------------
+# 👤 1. 공통 헬퍼 함수 (Helper Functions)
+# --------------------------------------------------------------------------
+
+def find_object(yolo_output, class_name):
+    """YOLO 결과에서 특정 클래스의 첫 번째 객체를 반환 (없으면 None)"""
+    return next((obj for obj in yolo_output if obj['class'] == class_name), None)
+
+def get_object_side(obj_x, image_width):
+    """객체의 X 좌표를 기준으로 화면 내 위치(왼쪽/오른쪽/중앙) 판단"""
+    if obj_x < image_width / 3: return "left"
+    elif obj_x > image_width * 2 / 3: return "right"
+    else: return "center"
+
+def _monitor_real_height_cm(inch, aspect_w=16, aspect_h=9):
+    diag_cm = inch * 2.54
+    return diag_cm * (aspect_h / math.sqrt(aspect_w ** 2 + aspect_h ** 2))
+
+def parse_inch_from_string(size_str):
+    if not isinstance(size_str, str): return None
+    numbers = re.findall(r"(\d+\.?\d*)", size_str)
+    return float(numbers[0]) if numbers else None
+
+def calculate_ideal_screen_height(user_height_cm, user_gender):
+    if user_gender == 'male': return ((3.32 * user_height_cm) - 25.50) / 10
+    elif user_gender == 'female': return ((2.61 * user_height_cm) + 93.84) / 10
+    else: return ((2.96 * user_height_cm) + 34.17) / 10
+
+def check_proximity(upper_box, lower_box, threshold_px=100):
+    upper_bottom_y = upper_box['y'] + upper_box['height'] / 2
+    lower_top_y = lower_box['y'] - lower_box['height'] / 2
+    horizontal_distance = abs(upper_box['x'] - lower_box['x'])
+    horizontal_alignment_threshold = (upper_box['width'] + lower_box['width']) / 4
+    is_vertically_close = abs(upper_bottom_y - lower_top_y) < threshold_px
+    is_horizontally_aligned = horizontal_distance < horizontal_alignment_threshold
+    return is_vertically_close and is_horizontally_aligned
+
+# --------------------------------------------------------------------------
+# 🧐 2. 인체공학 진단 분석 클래스 (ErgonomicsAnalyzer Class)
+# --------------------------------------------------------------------------
+class ErgonomicsAnalyzer:
+    def __init__(self, yolo_output, user_inputs, image_width_px=1280):
+        self.yolo_output = yolo_output
+        self.user_inputs = user_inputs
+        self.image_width_px = image_width_px
+        self.report = []
+        self.severity_map = {"High": "High", "Moderate": "Moderate", "Low": "Low"}
+        self.main_screen = None
+        self.px_to_cm_ratio = None
+
+    def _estimate_desk_y(self):
+        bottom_y_coords = []
+        for class_name in ['keyboard', 'mouse', 'wrist_rest', 'monitor support']:
+            obj = find_object(self.yolo_output, class_name)
+            if obj: bottom_y_coords.append(obj['box']['y'] + obj['box']['height'] / 2)
+        laptop = find_object(self.yolo_output, 'laptop')
+        support = find_object(self.yolo_output, 'monitor support')
+        if laptop:
+            is_on_support = support and check_proximity(laptop['box'], support['box'])
+            if not is_on_support: bottom_y_coords.append(laptop['box']['y'] + laptop['box']['height'] / 2)
+        if not bottom_y_coords: return None
+        return sum(bottom_y_coords) / len(bottom_y_coords)
+
+    def _analyze_screen_height(self, screen_obj, details={}):
+        if self.px_to_cm_ratio is None: return
+        user_height_cm = self.user_inputs.get("user_height_cm")
+        gender = self.user_inputs.get("gender")
+        if not all([user_height_cm, gender]): return
+        desk_y = self._estimate_desk_y()
+        if desk_y is None: desk_y = screen_obj['box']['y'] + screen_obj['box']['height'] / 2.0
+        ideal_height_cm = calculate_ideal_screen_height(user_height_cm, gender)
+        screen_top_y = screen_obj['box']['y'] - screen_obj['box']['height'] / 2.0
+        distance_px = desk_y - screen_top_y
+        estimated_actual_height_cm = round(distance_px * self.px_to_cm_ratio, 1)
+        delta = round(estimated_actual_height_cm - ideal_height_cm, 1)
+        abs_delta = abs(delta)
+        severity = self.severity_map["Low"]
+        if abs_delta > 15: severity = self.severity_map["High"]
+        elif abs_delta > 5: severity = self.severity_map["Moderate"]
+        problem_id = f"{screen_obj['class'].upper()}_HEIGHT"
+        details.update({"delta_cm": delta, "ideal_height_cm": ideal_height_cm, "estimated_actual_height_cm": estimated_actual_height_cm})
+        self.report.append({"problem_id": problem_id, "severity": severity, "details": details})
+
+    def detect_screens(self):
+        screen_classes = ['screen', 'laptop']
+        screens = [obj for obj in self.yolo_output if obj['class'] in screen_classes]
+        for i, screen in enumerate(screens): screen['id'] = f"screen_{i}"
+        return screens
+
+    def set_main_screen_by_id(self, screen_id, main_screen_inch_str):
+        screens = self.detect_screens()
+        selected_screen = next((s for s in screens if s.get('id') == screen_id), None)
+        if selected_screen:
+            self.main_screen = selected_screen
+            self.user_inputs['main_screen_inch'] = main_screen_inch_str
+            main_screen_inch = parse_inch_from_string(str(main_screen_inch_str))
+            if main_screen_inch and self.main_screen['box']['height'] > 0:
+                real_h_cm = _monitor_real_height_cm(main_screen_inch)
+                self.px_to_cm_ratio = real_h_cm / self.main_screen['box']['height']
+            return True
+        return False
+
+    def analyze_screen_setup(self):
+        screen = find_object(self.yolo_output, "screen")
+        if screen:
+            support = find_object(self.yolo_output, 'monitor support')
+            has_support = support and check_proximity(screen['box'], support['box'])
+            details = {"has_support": bool(has_support)}
+            self._analyze_screen_height(screen, details)
+
+    def analyze_laptop_setup(self):
+        laptop = find_object(self.yolo_output, "laptop")
+        if laptop:
+            support = find_object(self.yolo_output, 'monitor support')
+            has_support = support and check_proximity(laptop['box'], support['box'])
+            has_external_keyboard = find_object(self.yolo_output, 'keyboard') is not None
+            details = {"has_support": has_support, "has_external_keyboard": has_external_keyboard}
+            self._analyze_screen_height(laptop, details)
+
+    def analyze_window_position(self):
+        if self.main_screen is None or self.px_to_cm_ratio is None: return
+        window = find_object(self.yolo_output, "window")
+        if not window: return
+        horizontal_distance_px = abs(self.main_screen['box']['x'] - window['box']['x'])
+        horizontal_distance_cm = round(horizontal_distance_px * self.px_to_cm_ratio, 1)
+        severity = self.severity_map["Moderate"] if horizontal_distance_cm <= 50 else self.severity_map["Low"]
+        self.report.append({"problem_id": "WINDOW_POSITION", "severity": severity, "details": {"horizontal_distance_cm": horizontal_distance_cm}})
+
+    def analyze_light_position(self):
+        lamp = find_object(self.yolo_output, "desk lamp")
+        if not lamp: return
+        handedness = self.user_inputs.get("handedness", "right")
+        lamp_side = get_object_side(lamp['box']['x'], self.image_width_px)
+        is_misaligned = (handedness == "left" and lamp_side == "left") or (handedness == "right" and lamp_side == "right")
+        severity = self.severity_map["Moderate"] if is_misaligned else self.severity_map["Low"]
+        self.report.append({"problem_id": "LIGHT_POSITION", "severity": severity, "details": {"handedness": handedness, "lamp_side": lamp_side}})
+
+    def analyze_wrist_rest(self):
+        has_wrist_rest = find_object(self.yolo_output, "wrist_rest")
+        severity = self.severity_map["High"] if not has_wrist_rest else self.severity_map["Low"]
+        self.report.append({"problem_id": "WRIST_REST_PRESENCE", "severity": severity, "details": {"has_wrist_rest": bool(has_wrist_rest)}})
+
+    def analyze_keyboard_mouse_distance(self):
+        if self.px_to_cm_ratio is None: return
+        keyboard = find_object(self.yolo_output, "keyboard")
+        mouse = find_object(self.yolo_output, "mouse")
+        gender = self.user_inputs.get("gender")
+        if not all([keyboard, mouse, gender]): return
+        kbd_box, mouse_x = keyboard['box'], mouse['box']['x']
+        kbd_left_edge, kbd_right_edge = kbd_box['x'] - kbd_box['width'] / 2, kbd_box['x'] + kbd_box['width'] / 2
+        distance_px = 0
+        if kbd_left_edge <= mouse_x <= kbd_right_edge: distance_px = 0
+        elif mouse_x > kbd_right_edge: distance_px = mouse_x - kbd_right_edge
+        else: distance_px = kbd_left_edge - mouse_x
+        distance_cm = distance_px * self.px_to_cm_ratio
+        threshold_cm = 15 if gender == 'male' else 10
+        severity = self.severity_map["High"] if distance_cm > threshold_cm else self.severity_map["Low"]
+        self.report.append({"problem_id": "KEYBOARD_MOUSE_DISTANCE", "severity": severity, "details": {"actual_distance_cm": round(distance_cm, 1), "threshold_cm": threshold_cm}})
+
+    def analyze_keyboard_mouse_alignment(self):
+        keyboard = find_object(self.yolo_output, "keyboard")
+        mouse = find_object(self.yolo_output, "mouse")
+        if not all([keyboard, mouse]): return
+        kbd_box, mouse_center_y = keyboard['box'], mouse['box']['y']
+        ky_min, ky_max = kbd_box['y'] - kbd_box['height'] / 2, kbd_box['y'] + kbd_box['height'] / 2
+        is_vertically_aligned = (ky_min <= mouse_center_y <= ky_max)
+        severity = self.severity_map["Moderate"] if not is_vertically_aligned else self.severity_map["Low"]
+        self.report.append({"problem_id": "KEYBOARD_MOUSE_ALIGNMENT", "severity": severity, "details": {"is_vertically_aligned": is_vertically_aligned}})
+
+    def analyze_viewing_distance_by_ratio(self):
+        if not self.main_screen: return
+        ratio = self.main_screen['box']['width'] / self.image_width_px
+        severity = self.severity_map["Low"]
+        if ratio > 0.50: severity = self.severity_map["High"]
+        elif ratio < 0.40: severity = self.severity_map["Moderate"]
+        self.report.append({"problem_id": "VIEWING_DISTANCE", "severity": severity, "details": {"main_screen_type": self.main_screen['class'], "screen_width_ratio": f"{ratio:.1%}"}})
+
+    def run_all_analyses(self):
+        if not self.main_screen: raise ValueError("Main screen is not set. Call set_main_screen_by_id() first.")
+        self.analyze_light_position()
+        self.analyze_wrist_rest()
+        self.analyze_keyboard_mouse_distance()
+        self.analyze_keyboard_mouse_alignment()
+        self.analyze_window_position()
+        self.analyze_viewing_distance_by_ratio()
+        self.analyze_screen_setup()
+        self.analyze_laptop_setup()
+        return self.report
+
+# --------------------------------------------------------------------------
+# 🎨 3. 이미지 피드백 시각화 함수 (Professional Version)
+# --------------------------------------------------------------------------
+FONT_PATH = "LiberationSans-Regular.ttf"
+
+PROBLEM_COLOR = (255, 82, 82)
+IDEAL_COLOR = (0, 255, 255)
+IDEAL_TEXT_BG_COLOR = (0, 139, 139)
+
+def get_font(size=17):
+    try: return ImageFont.truetype(FONT_PATH, size=size)
+    except IOError: return ImageFont.load_default()
+
+def draw_text_with_bg(draw, pos, text, font, text_color="white", bg_color=(0,0,0,128), anchor="lt"):
+    bbox = draw.textbbox(pos, text, font=font, anchor=anchor)
+    padded_bbox = [bbox[0] - 5, bbox[1] - 2, bbox[2] + 5, bbox[3] + 2]
+    draw.rectangle(padded_bbox, fill=bg_color)
+    draw.text(pos, text, fill=text_color, font=font, anchor=anchor)
+
+def _draw_bounding_box(draw, obj, severity):
+    box = obj['box']
+    x1, y1 = box['x'] - box['width'] / 2, box['y'] - box['height'] / 2
+    x2, y2 = box['x'] + box['width'] / 2, box['y'] + box['height'] / 2
+
+    color = PROBLEM_COLOR
+    fill_color = color + (100,)
+
+    draw.rectangle([(x1, y1), (x2, y2)], outline=color, width=3, fill=fill_color)
+    draw_text_with_bg(draw, (x1 + 5, y1 + 5), obj['class'], get_font(), bg_color=color)
+
+def _draw_ideal_screen_box(draw, analyzer, report):
+    height_problem = next((p for p in report if "HEIGHT" in p["problem_id"] and p['severity'] != 'Low'), None)
+    viewing_dist_problem = next((p for p in report if p["problem_id"] == "VIEWING_DISTANCE" and p['severity'] != 'Low'), None)
+
+    # [수정] 높이 또는 거리 문제 중 하나라도 있으면 이상적인 박스를 그림
+    if not (height_problem or viewing_dist_problem) or not analyzer.main_screen or not analyzer.px_to_cm_ratio:
+        return
+
+    ideal_top_y = 0
+    current_top_y = analyzer.main_screen['box']['y'] - analyzer.main_screen['box']['height'] / 2
+
+    if height_problem:
+        details = height_problem["details"]
+        delta_cm = details['delta_cm']
+        delta_px = delta_cm / analyzer.px_to_cm_ratio
+        ideal_top_y = current_top_y - delta_px
+    else:
+        # 높이 문제가 없으면 현재 높이를 이상적인 높이로 간주
+        ideal_top_y = current_top_y
+
+    ideal_width = analyzer.image_width_px * 0.45
+    ideal_height = ideal_width * (9 / 16)
+
+    center_x = analyzer.image_width_px / 2
+    ix1, iy1 = center_x - ideal_width / 2, ideal_top_y
+    ix2, iy2 = center_x + ideal_width / 2, ideal_top_y + ideal_height
+
+    center_box_y = iy1 + (ideal_height / 2)
+    draw.rectangle([(ix1, iy1), (ix2, iy2)], outline=IDEAL_COLOR, width=4, fill=IDEAL_COLOR + (100,))
+    draw_text_with_bg(draw, (center_x, center_box_y), "Ideal Screen Position & Size", get_font(), bg_color=IDEAL_TEXT_BG_COLOR, anchor="mm")
+
+    if height_problem:
+        details = height_problem["details"]
+        delta_cm = details['delta_cm']
+        arrow_x = ix2 + 20
+        draw.line([(arrow_x, current_top_y), (arrow_x, ideal_top_y)], fill="yellow", width=5)
+        direction_text = "Move Up" if delta_cm > 0 else "Move Down"
+        text = f"{direction_text}: {abs(delta_cm)}cm"
+        draw_text_with_bg(draw, (arrow_x + 10, (current_top_y + ideal_top_y)/2), text, get_font(), bg_color="green", anchor="mm")
+
+def _draw_ideal_kb_mouse_position(draw, analyzer, report):
+    ideal_center_x = analyzer.image_width_px / 2
+    keyboard = find_object(analyzer.yolo_output, 'keyboard')
+    mouse = find_object(analyzer.yolo_output, 'mouse')
+    distance_problem = next((p for p in report if p['problem_id'] == 'KEYBOARD_MOUSE_DISTANCE'), None)
+    if not all([keyboard, mouse, analyzer.px_to_cm_ratio, distance_problem]): return
+
+    kb_y = keyboard['box']['y']
+    kb_w, kb_h = keyboard['box']['width'], keyboard['box']['height']
+    ikb_x1, ikb_y1 = ideal_center_x - kb_w / 2, kb_y - kb_h / 2
+    ikb_x2, ikb_y2 = ideal_center_x + kb_w / 2, kb_y + kb_h / 2
+    draw.rectangle([(ikb_x1, ikb_y1), (ikb_x2, ikb_y2)], outline=IDEAL_COLOR, width=3, fill=IDEAL_COLOR + (100,))
+    draw_text_with_bg(draw, (ideal_center_x, kb_y), "Ideal Keyboard", get_font(), bg_color=IDEAL_TEXT_BG_COLOR, anchor="mm")
+
+    threshold_cm = distance_problem['details']['threshold_cm']
+    threshold_px = threshold_cm / analyzer.px_to_cm_ratio
+    ideal_mouse_x = ikb_x2 + (threshold_px / 2) + (mouse['box']['width'] / 2)
+    mouse_w, mouse_h = mouse['box']['width'], mouse['box']['height']
+    im_x1, im_y1 = ideal_mouse_x - mouse_w / 2, kb_y - mouse_h / 2
+    im_x2, im_y2 = ideal_mouse_x + mouse_w / 2, kb_y + mouse_h / 2
+    draw.rectangle([(im_x1, im_y1), (im_x2, im_y2)], outline=IDEAL_COLOR, width=3, fill=IDEAL_COLOR + (100,))
+    draw_text_with_bg(draw, (ideal_mouse_x, kb_y), "Ideal Mouse", get_font(), bg_color=IDEAL_TEXT_BG_COLOR, anchor="mm")
+
+def _draw_light_position_feedback(draw, analyzer, problem):
+    lamp = find_object(analyzer.yolo_output, "desk lamp")
+    if not lamp: return
+    lamp_w, lamp_h, lamp_y = lamp['box']['width'], lamp['box']['height'], lamp['box']['y']
+    ideal_x = analyzer.image_width_px / 6 if problem['details']['lamp_side'] == 'right' else analyzer.image_width_px * 5 / 6
+    ix1, iy1 = ideal_x - lamp_w / 2, lamp_y - lamp_h / 2
+    ix2, iy2 = ideal_x + lamp_w / 2, lamp_y + lamp_h / 2
+    draw.rectangle([(ix1, iy1), (ix2, iy2)], outline=IDEAL_COLOR, width=3, fill=IDEAL_COLOR+(70,))
+    draw_text_with_bg(draw, (ideal_x, lamp_y), "Ideal Lamp Position", get_font(), bg_color=IDEAL_TEXT_BG_COLOR, anchor="mm")
+
+def _draw_wrist_rest_feedback(draw, yolo_output):
+    mouse = find_object(yolo_output, "mouse")
+    if not mouse: return
+    box = mouse['box']
+    x1, y1 = box['x'] - box['width'] * 1.5, box['y'] + box['height'] / 2
+    x2, y2 = box['x'] + box['width'] * 1.5, box['y'] + box['height'] / 2 + 30
+    draw.rectangle([(x1, y1), (x2, y2)], outline=IDEAL_COLOR, width=3, fill=IDEAL_COLOR + (80,))
+    draw_text_with_bg(draw, (box['x'], y1 + 15), "Mouse Cushion Needed", get_font(), bg_color=IDEAL_TEXT_BG_COLOR, anchor="mm")
+
+
+def draw_feedback_on_image(image_bytes, report, analyzer):
+    image = Image.open(BytesIO(image_bytes)).convert("RGBA")
+
+    problems_to_draw = [p for p in report if p['severity'] != 'Low']
+    if not problems_to_draw:
+        print("\n--- 🎨 시각화 정보 ---")
+        print("  - ⚠️ 시각화할 'High' 또는 'Moderate' 심각도의 문제가 없습니다. 원본 이미지를 반환합니다.")
+        return image.convert("RGB")
+
+    problem_overlay = Image.new("RGBA", image.size, (255, 255, 255, 0))
+    problem_draw = ImageDraw.Draw(problem_overlay)
+
+    problematic_objects = {}
+    for problem in report:
+        if problem['severity'] == 'Low': continue
+        problem_id = problem["problem_id"]
+        involved_classes = []
+        if "HEIGHT" in problem_id: involved_classes.append(problem_id.split('_')[0].lower())
+        elif "KEYBOARD_MOUSE" in problem_id: involved_classes.extend(["keyboard", "mouse"])
+        elif "WRIST_REST" in problem_id: involved_classes.append("mouse")
+        elif "VIEWING_DISTANCE" in problem_id:
+            if analyzer.main_screen: involved_classes.append(analyzer.main_screen['class'])
+        elif "LIGHT_POSITION" in problem_id: involved_classes.append("desk lamp")
+        for class_name in involved_classes:
+            obj = find_object(analyzer.yolo_output, class_name)
+            if obj: problematic_objects[class_name] = (obj, problem['severity'])
+
+    for class_name, (obj, severity) in problematic_objects.items():
+        _draw_bounding_box(problem_draw, obj, severity)
+
+    ideal_overlay = Image.new("RGBA", image.size, (255, 255, 255, 0))
+    ideal_draw = ImageDraw.Draw(ideal_overlay)
+
+    drawn_kb_mouse_ideal, drawn_screen_ideal = False, False
+    for problem in report:
+        if problem['severity'] == 'Low': continue
+        problem_id = problem["problem_id"]
+
+        if problem_id in ["SCREEN_HEIGHT", "LAPTOP_HEIGHT", "VIEWING_DISTANCE"]:
+            if not drawn_screen_ideal:
+                _draw_ideal_screen_box(ideal_draw, analyzer, report)
+                drawn_screen_ideal = True
+        elif problem_id in ["KEYBOARD_MOUSE_DISTANCE", "KEYBOARD_MOUSE_ALIGNMENT"]:
+            if not drawn_kb_mouse_ideal:
+                _draw_ideal_kb_mouse_position(ideal_draw, analyzer, report)
+                drawn_kb_mouse_ideal = True
+        elif problem_id == "LIGHT_POSITION":
+            _draw_light_position_feedback(ideal_draw, analyzer, problem)
+        elif problem_id == "WRIST_REST_PRESENCE" and not problem["details"]["has_wrist_rest"]:
+            _draw_wrist_rest_feedback(problem_draw, analyzer.yolo_output)
+
+    image_with_problems = Image.alpha_composite(image, problem_overlay)
+    final_image = Image.alpha_composite(image_with_problems, ideal_overlay)
+
+    return final_image.convert("RGB")
+
+# --------------------------------------------------------------------------
+# 🧪 4. 테스트 실행 영역
+# --------------------------------------------------------------------------
+
+# =================================================================
+# ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼ 사용자 입력 영역 ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼
+# =================================================================
+
+YOUR_IMAGE_PATH = "/content/d9d6d99d3673d60df3b5ed0e71412ece.jpg"
+
+YOUR_ROBOFLOW_OUTPUT = {
+  "predictions": [
+    {
+      "x": 376.5,
+      "y": 557.5,
+      "width": 485,
+      "height": 297,
+      "confidence": 0.948,
+      "class": "screen",
+      "class_id": 5,
+      "detection_id": "c32dd189-ab26-412a-bd9c-d7cb847cd986"
+    },
+    {
+      "x": 337.5,
+      "y": 907,
+      "width": 351,
+      "height": 102,
+      "confidence": 0.941,
+      "class": "keyboard",
+      "class_id": 1,
+      "detection_id": "b1cbb8bd-d074-42fc-9375-bbeee401d18b"
+    },
+    {
+      "x": 174,
+      "y": 428,
+      "width": 154,
+      "height": 172,
+      "confidence": 0.938,
+      "class": "desk lamp",
+      "class_id": 0,
+      "detection_id": "e860c2ef-d457-44d6-8650-b536fc2e0b90"
+    },
+    {
+      "x": 569,
+      "y": 910.5,
+      "width": 84,
+      "height": 71,
+      "confidence": 0.932,
+      "class": "mouse",
+      "class_id": 4,
+      "detection_id": "92c1c801-fb3b-4765-b8e5-be9cbe9cc8b3"
+    }
+  ]
+}
+YOUR_USER_INPUTS = {"user_height_cm": 175, "gender": "male", "handedness": "left"}
+YOUR_MAIN_SCREEN_INCH = "24인치"
+
+# =================================================================
+# ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲ 사용자 입력 영역 끝 ▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲▲
+# =================================================================
+
+# --- 이하 코드는 자동으로 실행됩니다 ---
+image_path = YOUR_IMAGE_PATH
+
+if image_path and os.path.exists(image_path):
+    yolo_output = []
+    for pred in YOUR_ROBOFLOW_OUTPUT['predictions']:
+        yolo_output.append({
+            'class': pred['class'],
+            'box': {'x': pred['x'], 'y': pred['y'], 'width': pred['width'], 'height': pred['height']}
+        })
+
+    with Image.open(image_path) as img:
+        img_width, img_height = img.size
+
+    analyzer = ErgonomicsAnalyzer(yolo_output, YOUR_USER_INPUTS, img_width)
+
+    screens = analyzer.detect_screens()
+    if screens:
+        main_screen_obj = max(screens, key=lambda s: s['box']['width'] * s['box']['height'])
+        analyzer.set_main_screen_by_id(main_screen_obj['id'], YOUR_MAIN_SCREEN_INCH)
+
+        print("\n--- 🕵️‍♂️ Debugging Info ---")
+        print(f"  - Main screen object selected: {analyzer.main_screen['class']} (ID: {analyzer.main_screen['id']})")
+        if analyzer.px_to_cm_ratio:
+            print(f"  - Calculated cm/px ratio: {analyzer.px_to_cm_ratio:.4f}")
+        else:
+            print("  - ⚠️ Failed to calculate cm/px ratio. Check screen size input or YOLO data.")
+        print("-------------------------\n")
+
+        report = analyzer.run_all_analyses()
+        print("\n--- Analysis Report (JSON) ---")
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        feedback_image = draw_feedback_on_image(image_bytes=image_bytes, report=report, analyzer=analyzer)
+
+        original_image = Image.open(image_path)
+        fig, axes = plt.subplots(1, 2, figsize=(20, 10))
+        axes[0].imshow(original_image)
+        axes[0].set_title("Original Image", fontsize=16)
+        axes[0].axis('off')
+        axes[1].imshow(feedback_image)
+        axes[1].set_title("Professional Feedback Visualization", fontsize=16)
+        axes[1].axis('off')
+        plt.show()
+    else:
+        print("No screen detected for analysis.")
+else:
+    print(f"Image file not found: {image_path}")
+    print("Please make sure to upload the image file to Colab.")
