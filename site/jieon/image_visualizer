@@ -1,0 +1,267 @@
+from PIL import Image, ImageDraw, ImageFont
+from io import BytesIO
+
+# 기본 폰트 경로: 로컬 환경에 폰트 파일이 없으면 PIL 기본 폰트로 폴백합니다.
+FONT_PATH = "LiberationSans-Regular.ttf"
+
+PROBLEM_COLOR = (255, 82, 82)
+IDEAL_COLOR = (0, 255, 255)
+IDEAL_TEXT_BG_COLOR = (0, 139, 139)
+
+
+def find_object(yolo_output, class_name):
+    """YOLO 결과에서 특정 클래스의 첫 번째 객체를 반환 (없으면 None)"""
+    if not yolo_output:
+        return None
+    return next((obj for obj in yolo_output if obj.get('class') == class_name), None)
+
+
+def get_font(size=24):
+    """기본 폰트를 로드하는 헬퍼 함수"""
+    try:
+        return ImageFont.truetype(FONT_PATH, size=size)
+    except Exception:
+        return ImageFont.load_default()
+
+
+def draw_text_with_bg(draw, pos, text, font, text_color="white", bg_color=(0, 0, 0, 160), anchor="lt"):
+    """텍스트 뒤에 반투명 배경을 그려 가독성을 높입니다."""
+    try:
+        bbox = draw.textbbox(pos, text, font=font, anchor=anchor)
+    except Exception:
+        # Pillow 버전에 따라 textbbox가 없을 수 있음
+        w, h = draw.textsize(text, font=font)
+        x, y = pos
+        bbox = (x, y, x + w, y + h)
+    padded_bbox = [bbox[0] - 6, bbox[1] - 3, bbox[2] + 6, bbox[3] + 3]
+    draw.rectangle(padded_bbox, fill=bg_color)
+    draw.text(pos, text, fill=text_color, font=font, anchor=anchor)
+
+
+def _draw_bounding_box(draw, obj, severity):
+    """문제 객체에 반투명 채움과 테두리가 있는 바운딩 박스를 그립니다."""
+    if not obj or 'box' not in obj:
+        return
+    box = obj['box']
+    x1 = box['x'] - box['width'] / 2
+    y1 = box['y'] - box['height'] / 2
+    x2 = box['x'] + box['width'] / 2
+    y2 = box['y'] + box['height'] / 2
+    color = PROBLEM_COLOR
+    fill_color = color + (90,)
+    draw.rectangle([(x1, y1), (x2, y2)], outline=color, width=3, fill=fill_color)
+    draw_text_with_bg(draw, (x1 + 6, y1 + 6), obj.get('class', 'obj'), get_font(18), bg_color=color + (160,))
+
+
+def _draw_ideal_screen_box(draw, analyzer, report):
+    """
+    화면 높이 문제(또는 viewing distance)를 기준으로 이상적인 스크린 박스를 그림.
+    analyzer에서 안전하게 필요한 속성을 읽음.
+    """
+    if not analyzer:
+        return
+    px_to_cm = getattr(analyzer, "px_to_cm_ratio", None)
+    main_screen = getattr(analyzer, "main_screen", None)
+    image_width = getattr(analyzer, "image_width_px", None) or getattr(analyzer, "image_width", None)
+    if not main_screen or px_to_cm is None or not image_width:
+        return
+
+    # 높이 관련 문제 우선 검색
+    height_problem = next((p for p in report if "HEIGHT" in (p.get("problem_id") or "") and p.get('severity') != 'Low'), None)
+    viewing_problem = next((p for p in report if p.get("problem_id") == "VIEWING_DISTANCE" and p.get('severity') != 'Low'), None)
+
+    if not height_problem and not viewing_problem:
+        return
+
+    # 현재 스크린 top y
+    current_top_y = main_screen['box']['y'] - main_screen['box']['height'] / 2
+
+    # delta 계산: 높이 문제가 있으면 그것을 기준, 없으면 0 (현재 위치 유지)
+    if height_problem:
+        details = height_problem.get("details", {})
+        delta_cm = details.get("delta_cm", 0)
+        # px로 변환
+        try:
+            delta_px = delta_cm / px_to_cm
+        except Exception:
+            delta_px = 0
+        ideal_top_y = current_top_y - delta_px
+    else:
+        ideal_top_y = current_top_y
+
+    # 이상적 박스 크기: 화면 너비 기준 비율로 그림 (16:9 비율 가정)
+    ideal_width = image_width * 0.45
+    ideal_height = ideal_width * (9 / 16)
+    center_x = image_width / 2
+
+    ix1, iy1 = center_x - ideal_width / 2, ideal_top_y
+    ix2, iy2 = center_x + ideal_width / 2, ideal_top_y + ideal_height
+
+    draw.rectangle([(ix1, iy1), (ix2, iy2)], outline=IDEAL_COLOR, width=3, fill=IDEAL_COLOR + (80,))
+    center_box_y = iy1 + ideal_height / 2
+    draw_text_with_bg(draw, (center_x, center_box_y), "Ideal Screen Position", get_font(18), bg_color=IDEAL_TEXT_BG_COLOR + (200,), anchor="mm")
+
+    if height_problem:
+        details = height_problem.get("details", {})
+        delta_cm = details.get("delta_cm", 0)
+        arrow_x = ix2 + 18
+        draw.line([(arrow_x, current_top_y), (arrow_x, ideal_top_y)], fill=(255, 215, 0), width=5)
+        direction_text = "Move Up" if delta_cm > 0 else "Move Down"
+        text = f"{direction_text}: {abs(delta_cm)}cm"
+        draw_text_with_bg(draw, (arrow_x + 8, (current_top_y + ideal_top_y) / 2), text, get_font(16), bg_color=(34, 139, 34, 220))
+
+
+def _draw_ideal_kb_mouse_position(draw, analyzer, report):
+    """
+    키보드/마우스 이상적 위치를 그림: 키보드를 중앙에 두고 마우스를 적절한 거리에 배치.
+    """
+    if not analyzer:
+        return
+    yolo = getattr(analyzer, "yolo_output", []) or []
+    px_to_cm = getattr(analyzer, "px_to_cm_ratio", None)
+    image_width = getattr(analyzer, "image_width_px", None) or getattr(analyzer, "image_width", None)
+    keyboard = find_object(yolo, 'keyboard')
+    mouse = find_object(yolo, 'mouse')
+    distance_problem = next((p for p in report if p.get('problem_id') == 'KEYBOARD_MOUSE_DISTANCE'), None)
+    if not all([keyboard, mouse, px_to_cm, image_width, distance_problem]):
+        return
+
+    kb_y = keyboard['box']['y']
+    kb_w = keyboard['box']['width']
+    kb_h = keyboard['box']['height']
+    ideal_center_x = image_width / 2
+
+    ikb_x1, ikb_y1 = ideal_center_x - kb_w / 2, kb_y - kb_h / 2
+    ikb_x2, ikb_y2 = ideal_center_x + kb_w / 2, kb_y + kb_h / 2
+    draw.rectangle([(ikb_x1, ikb_y1), (ikb_x2, ikb_y2)], outline=IDEAL_COLOR, width=3, fill=IDEAL_COLOR + (70,))
+    draw_text_with_bg(draw, (ideal_center_x, kb_y), "Ideal Keyboard", get_font(16), bg_color=IDEAL_TEXT_BG_COLOR + (200,), anchor="mm")
+
+    threshold_cm = distance_problem.get('details', {}).get('threshold_cm', None)
+    try:
+        threshold_px = threshold_cm / px_to_cm if threshold_cm is not None else keyboard['box']['width'] * 0.5
+    except Exception:
+        threshold_px = keyboard['box']['width'] * 0.5
+
+    ideal_mouse_x = ikb_x2 + (threshold_px / 2) + (mouse['box']['width'] / 2)
+    mouse_w, mouse_h = mouse['box']['width'], mouse['box']['height']
+    im_x1, im_y1 = ideal_mouse_x - mouse_w / 2, kb_y - mouse_h / 2
+    im_x2, im_y2 = ideal_mouse_x + mouse_w / 2, kb_y + mouse_h / 2
+    draw.rectangle([(im_x1, im_y1), (im_x2, im_y2)], outline=IDEAL_COLOR, width=3, fill=IDEAL_COLOR + (70,))
+    draw_text_with_bg(draw, (ideal_mouse_x, kb_y), "Ideal Mouse", get_font(16), bg_color=IDEAL_TEXT_BG_COLOR + (200,), anchor="mm")
+
+
+def _draw_light_position_feedback(draw, analyzer, problem):
+    """조명(데스크 램프) 이상적 위치 제시"""
+    yolo = getattr(analyzer, "yolo_output", []) or []
+    lamp = find_object(yolo, "desk lamp")
+    image_width = getattr(analyzer, "image_width_px", None) or getattr(analyzer, "image_width", None)
+    if not lamp or not image_width:
+        return
+    # 문제의 lamp_side가 'left' 또는 'right'로 들어옴
+    side = problem.get('details', {}).get('lamp_side', None)
+    if side == 'left':
+        ideal_x = image_width * 1 / 6
+    elif side == 'right':
+        ideal_x = image_width * 5 / 6
+    else:
+        ideal_x = image_width / 2
+    lamp_w, lamp_h = lamp['box']['width'], lamp['box']['height']
+    ix1, iy1 = ideal_x - lamp_w / 2, lamp['box']['y'] - lamp_h / 2
+    ix2, iy2 = ideal_x + lamp_w / 2, lamp['box']['y'] + lamp_h / 2
+    draw.rectangle([(ix1, iy1), (ix2, iy2)], outline=IDEAL_COLOR, width=3, fill=IDEAL_COLOR + (70,))
+    draw_text_with_bg(draw, (ideal_x, lamp['box']['y']), "Ideal Lamp", get_font(14), bg_color=IDEAL_TEXT_BG_COLOR + (200,), anchor="mm")
+
+
+def _draw_wrist_rest_feedback(draw, yolo_output):
+    """마우스 옆에 손목 받침대 영역을 제시"""
+    mouse = find_object(yolo_output, "mouse")
+    if not mouse:
+        return
+    box = mouse['box']
+    x1 = box['x'] - box['width'] * 1.6
+    y1 = box['y'] + box['height'] / 2
+    x2 = box['x'] + box['width'] * 1.6
+    y2 = y1 + 28
+    draw.rectangle([(x1, y1), (x2, y2)], outline=IDEAL_COLOR, width=2, fill=IDEAL_COLOR + (70,))
+    draw_text_with_bg(draw, (box['x'], y1 + 14), "Mouse Cushion Suggested", get_font(14), bg_color=IDEAL_TEXT_BG_COLOR + (200,), anchor="mm")
+
+
+def draw_feedback_on_image(image_bytes, report, analyzer):
+    """
+    메인 함수: 원본 이미지 바이트, 분석 리포트, 분석기 인스턴스를 받아
+    문제 영역(붉게)과 이상적 위치(청록색) 레이어를 합성한 PIL.Image를 반환합니다.
+    """
+    try:
+        image = Image.open(BytesIO(image_bytes)).convert("RGBA")
+    except Exception:
+        # image_bytes가 이미 PIL Image일 경우 처리
+        if hasattr(image_bytes, "convert"):
+            image = image_bytes.convert("RGBA")
+        else:
+            raise
+
+    # 문제 등급이 'Low'가 아닌 항목만 그림
+    problems_to_draw = [p for p in report if p.get('severity') and p.get('severity') != 'Low']
+    if not problems_to_draw:
+        # 변경할 것이 없으면 원본 반환
+        return image.convert("RGB")
+
+    # 문제점 레이어
+    problem_overlay = Image.new("RGBA", image.size, (255, 255, 255, 0))
+    problem_draw = ImageDraw.Draw(problem_overlay)
+
+    problematic_objects = {}
+    for problem in report:
+        if problem.get('severity') == 'Low':
+            continue
+        pid = problem.get("problem_id", "")
+        involved_classes = []
+        if "HEIGHT" in pid:
+            involved_classes.append(pid.split('_')[0].lower())
+        elif "KEYBOARD_MOUSE" in pid:
+            involved_classes.extend(["keyboard", "mouse"])
+        elif "WRIST_REST" in pid:
+            involved_classes.append("mouse")
+        elif "VIEWING_DISTANCE" in pid:
+            main_cls = getattr(analyzer, "main_screen", {}).get('class') if getattr(analyzer, "main_screen", None) else None
+            if main_cls:
+                involved_classes.append(main_cls)
+        elif "LIGHT_POSITION" in pid:
+            involved_classes.append("desk lamp")
+
+        for cls in involved_classes:
+            obj = find_object(getattr(analyzer, "yolo_output", []) or [], cls)
+            if obj:
+                problematic_objects[cls] = (obj, problem.get('severity'))
+
+    for cls_name, (obj, severity) in problematic_objects.items():
+        _draw_bounding_box(problem_draw, obj, severity)
+
+    # 이상적 위치 레이어
+    ideal_overlay = Image.new("RGBA", image.size, (255, 255, 255, 0))
+    ideal_draw = ImageDraw.Draw(ideal_overlay)
+
+    drawn_kb_mouse_ideal = False
+    drawn_screen_ideal = False
+
+    for problem in report:
+        if problem.get('severity') == 'Low':
+            continue
+        pid = problem.get("problem_id", "")
+        if pid in ["SCREEN_HEIGHT", "LAPTOP_HEIGHT", "VIEWING_DISTANCE"]:
+            if not drawn_screen_ideal:
+                _draw_ideal_screen_box(ideal_draw, analyzer, report)
+                drawn_screen_ideal = True
+        elif pid in ["KEYBOARD_MOUSE_DISTANCE", "KEYBOARD_MOUSE_ALIGNMENT"]:
+            if not drawn_kb_mouse_ideal:
+                _draw_ideal_kb_mouse_position(ideal_draw, analyzer, report)
+                drawn_kb_mouse_ideal = True
+        elif pid == "LIGHT_POSITION":
+            _draw_light_position_feedback(ideal_draw, analyzer, problem)
+        elif pid == "WRIST_REST_PRESENCE" and not problem.get("details", {}).get("has_wrist_rest", True):
+            _draw_wrist_rest_feedback(ideal_draw, getattr(analyzer, "yolo_output", []) or [])
+
+    # 합성
+    image_with_problems = Image.alpha_composite(image, problem_overlay)
+    final_image = Image.alpha_composite(image_with_problems, ideal_overlay)
+    return final_image.convert("RGB")
