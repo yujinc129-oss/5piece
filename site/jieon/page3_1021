@@ -1,0 +1,67 @@
+# pages/page3.py
+import streamlit as st
+
+def _local_safe_rerun():
+    """
+    페이지 모듈이 app.py의 _safe_rerun를 직접 import하지 못할 수 있으므로
+    여기에서도 폴백으로 rerun/experimental_rerun을 호출하도록 구현.
+    """
+    if hasattr(st, "rerun") and callable(getattr(st, "rerun")):
+        st.rerun()
+    elif hasattr(st, "experimental_rerun") and callable(getattr(st, "experimental_rerun")):
+        st.experimental_rerun()
+    else:
+        raise RuntimeError("Streamlit rerun 기능을 사용할 수 없습니다. st.rerun 또는 st.experimental_rerun이 필요합니다.")
+
+def user_info_form():
+    if 'user_info' not in st.session_state:
+        st.session_state.user_info = None
+
+    if st.session_state.user_info:
+        st.success("정보가 성공적으로 제출되었습니다!")
+        st.subheader("📊 입력된 정보 요약")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("성별", st.session_state.user_info.get('gender', "-"))
+        col2.metric("키", f"{st.session_state.user_info.get('height', '-') } cm")
+        col3.metric("주 사용 손", st.session_state.user_info.get('dominant_hand', "-"))
+        st.markdown("---")
+        if st.button("정보 다시 입력하기"):
+            st.session_state.user_info = None
+            try:
+                # 우선 app.py의 _safe_rerun가 있으면 사용 시도
+                if "_safe_rerun" in globals():
+                    _safe_rerun()  # if imported into same namespace
+                else:
+                    _local_safe_rerun()
+            except Exception:
+                # 폴백: 가능한 st의 rerun 함수를 직접 호출
+                if hasattr(st, "rerun"):
+                    st.rerun()
+                elif hasattr(st, "experimental_rerun"):
+                    st.experimental_rerun()
+    else:
+        with st.form(key='user_info_form'):
+            st.subheader("📄 사용자 정보를 입력해주세요")
+            col1, col2 = st.columns(2)
+            with col1:
+                gender = st.radio("성별", options=('여성', '남성'), horizontal=True)
+            with col2:
+                height = st.number_input("키 (신장, cm)", min_value=100, max_value=250, value=165, step=1)
+            dominant_hand = st.radio("주 사용 손", options=('오른손', '왼손'), horizontal=True)
+            submitted = st.form_submit_button('제출하기')
+            if submitted:
+                st.session_state.user_info = {
+                    "gender": gender,
+                    "height": height,
+                    "dominant_hand": dominant_hand
+                }
+                try:
+                    if "_safe_rerun" in globals():
+                        _safe_rerun()
+                    else:
+                        _local_safe_rerun()
+                except Exception:
+                    if hasattr(st, "rerun"):
+                        st.rerun()
+                    elif hasattr(st, "experimental_rerun"):
+                        st.experimental_rerun()
