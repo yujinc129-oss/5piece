@@ -52,3 +52,4 @@ def user_info_form():
                  key="hand_input")  # key 추가
 
         st.info("정보를 입력한 뒤, 하단의 '입력 완료' 버튼을 눌러주세요.")
+
