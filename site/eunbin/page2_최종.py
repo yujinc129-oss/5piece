@@ -18,6 +18,9 @@ def run_monitor_detection():
     st.markdown("#### 💡 올바른 사진 촬영 가이드")
     st.info("정확한 분석을 위해, 아래 가이드를 참고하여 책상 사진을 찍어주세요.")
 
+
+
+
     col1, col2 = st.columns([1.0, 1.0])  # 텍스트와 이미지 영역 비율
 
     with col1:
