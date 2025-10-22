@@ -26,6 +26,10 @@ import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from PIL import Image
+
+
+
 # 로깅 설정
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -375,7 +379,7 @@ PROBLEM_ID_MAP = {
 }
 
 SEVERITY_MAP = {
-    "High": "높음 🩸",
+    "High": "높음 🚨",
     "Moderate": "중간 ⚠️",
     "Low": "낮음 ✅"
 }
@@ -392,9 +396,9 @@ def format_details_korean(problem_id: str, details: dict) -> str:
         ideal = details.get('ideal_height_cm', 0)
         actual = details.get('estimated_actual_height_cm', 0)
         if delta > 0:
-            return f"화면이 이상적인 높이({ideal}cm)보다 약 {delta}cm 높습니다. 화면을 낮춰주세요."
+            return f"화면이 이상적인 높이({ideal:.1f}cm)보다 약 {delta:.1f}cm 높습니다. 화면을 낮춰주세요."
         else:
-            return f"화면이 이상적인 높이({ideal}cm)보다 약 {abs(delta)}cm 낮습니다. 받침대를 사용해 높여주세요."
+            return f"화면이 이상적인 높이({ideal:.1f}cm)보다 약 {abs(delta):.1f}cm 낮습니다. 받침대를 사용해 높여주세요."
 
     elif problem_id == "VIEWING_DISTANCE":
         ratio = details.get('screen_width_ratio', '0%')
@@ -411,7 +415,26 @@ def format_details_korean(problem_id: str, details: dict) -> str:
 
     elif problem_id == "KEYBOARD_MOUSE_DISTANCE":
         actual = details.get('actual_distance_cm', 0)
-        return f"키보드와 마우스 사이의 거리가 약 {actual}cm로, 어깨 너비보다 넓어 보입니다. 어깨에 부담을 줄 수 있으니 간격을 좁혀주세요."
+        threshold = details.get('threshold_cm', 10)
+        if actual > threshold:
+            return f"키보드와 마우스 사이의 거리가 약 {actual}cm로, 어깨 너비보다 넓어 보입니다. 어깨에 부담을 줄 수 있으니 간격을 좁혀주세요."
+        else:
+            return "키보드와 마우스 사이의 거리가 적절합니다."
+
+    # ▼▼▼ [수정됨] 이 두 항목이 추가되었습니다 ▼▼▼
+    elif problem_id == "KEYBOARD_MOUSE_ALIGNMENT":
+        if details.get("is_vertically_aligned"):
+            return "키보드와 마우스가 팔을 뻗었을 때 자연스러운 위치에 나란히 정렬되어 있습니다."
+        else:
+            return "마우스가 키보드보다 너무 앞(멀리) 또는 뒤(가까이)에 있습니다. 키보드와 마우스의 앞뒤 라인을 맞춰주세요."
+
+    elif problem_id == "WINDOW_POSITION":
+        dist = details.get('horizontal_distance_cm', 0)
+        if dist <= 50:
+            return f"창문과 모니터가 약 {dist}cm로 너무 가깝습니다. 창문에서 들어오는 빛이 화면에 반사되어 눈부심을 유발할 수 있습니다."
+        else:
+            return "창문과 모니터의 거리가 적절하여 눈부심 위험이 낮습니다."
+    # ▲▲▲ [수정] 여기까지 ▲▲▲
 
     # 다른 모든 케이스에 대한 기본 설명
     return json.dumps(details, ensure_ascii=False)
@@ -419,11 +442,100 @@ def format_details_korean(problem_id: str, details: dict) -> str:
 
 # --- Streamlit 앱 메인 ---
 st.set_page_config(page_title="인체공학적 책상 개선 가이드", page_icon="🦾", layout="centered")
-st.title("🦾 인체공학적 책상 개선 가이드 서비스")
-st.markdown("---")
 
+# st.title("🦾 인체공학적 책상 개선 가이드 서비스")
+
+# st.markdown("""
+# <div style="display: flex; align-items: center;">
+#     <img src='C:\workspace\website_frame\project\5piece.png' width="50" style="margin-right: 10px;">
+#     <div style="font-size: 43px; font-weight: bold;">인체공학적 책상 개선 가이드 서비스</div>
+# </div>
+# """, unsafe_allow_html=True)
+
+
+
+# 이미지 불러오기
+# image = Image.open("C:/workspace/website_frame/project/5piece.png")
+#
+# # 이미지와 텍스트 나란히 배치
+# col1, col2 = st.columns([1, 6.5])
+# with col1:
+#     st.image(image, width=68)  # 이미지 크기 키움
+# with col2:
+#     st.markdown("<div style='font-size:40px; font-weight:bold; color:white; margin-top:10px'>인체공학적 책상 개선 가이드 서비스</div>", unsafe_allow_html=True)
+#
+#
+# st.markdown("---")
+#
+# if 'current_page' not in st.session_state:
+#     st.session_state['current_page'] = 1
+
+
+# [수정] 페이지 번호를 먼저 가져옵니다.
 if 'current_page' not in st.session_state:
     st.session_state['current_page'] = 1
+page = st.session_state.get('current_page', 1)
+
+# [수정] 페이지 번호에 따라 제목의 글자 색을 결정합니다.
+if page == 1:
+    TEXT_COLOR = "white" # 1페이지는 흰색 (배경이 흰색이라 안 보일 수 있습니다)
+else:
+    TEXT_COLOR = "black" # 2페이지부터는 검은색
+
+# --- 기존 헤더 로직에 TEXT_COLOR 변수 적용 ---
+# --- [수정] 1페이지가 아닐 때만 헤더(로고, 제목)를 표시합니다 ---
+if page != 1:
+    try:
+        # 이미지 불러오기
+        image = Image.open("C:/workspace/website_frame/project/5piece.png")
+
+        # 이미지와 텍스트 나란히 배치
+        col1, col2 = st.columns([1, 6.5])
+        with col1:
+            st.image(image, width=68)
+        with col2:
+            # [수정] 'color: {TEXT_COLOR};' 부분만 수정됨
+            # (페이지 배경색은 변경하지 않습니다)
+            st.markdown(f"""
+                <div style='
+                    font-size: 40px;
+                    font-weight: bold;
+                    color: {TEXT_COLOR}; 
+                    margin-top: 10px;
+                '>
+                    인체공학적 책상 개선 가이드 서비스
+                </div>
+            """, unsafe_allow_html=True)
+
+    except FileNotFoundError:
+        st.warning("로고 이미지를 찾을 수 없습니다. (C:/workspace/website_frame/project/5piece.png)")
+        st.markdown(f"<div style='font-size:40px; font-weight:bold; color:{TEXT_COLOR}; margin-top:10px'>인체공학적 책상 개선 가이드 서비스</div>", unsafe_allow_html=True)
+    st.markdown("---")
+# [수정] 제목 바로 밑의 구분선은 모든 페이지에 공통으로 표시합니다.
+# (이 라인은 if문 바깥으로 둡니다)
+
+
+st.markdown("""
+    <style>
+    /* 모든 페이지의 버튼에 공통 스타일 적용 */
+    div.stButton > button:first-child {
+        background-color: #FDF5E6;  /* 연한 노란색 배경 */
+        color: #333333;              /* 어두운 회색 글자 (gray보다 진함) */
+        font-weight: bold;
+        font-size: 1.1em;           /* 1.3em은 너무 큰 감이 있어 1.1em으로 조정 */
+        border-radius: 10px;
+        padding: 0.5em 1em;
+        border: 2px solid #FDF5E6;  /* 테두리를 어두운 노란색으로 통일 */
+    }
+
+    /* 버튼에 마우스를 올렸을 때 */
+    div.stButton > button:first-child:hover {
+        background-color: #FDDCAA;  
+        # color: white;               /* 흰색 글자 */
+        border: 2px solid #FDDCAA;
+    }
+    </style>
+""", unsafe_allow_html=True)
 
 
 def display_page():
@@ -452,10 +564,32 @@ def display_page():
 # --- 페이지별 네비게이션 및 로직 ---
 page = st.session_state.get('current_page', 1)
 display_page()
-st.markdown("---")
+# 4, 5 페이지에서는 이 구분선을 제거합니다.
+if page in [1, 2, 3]:
+    st.markdown("---")
 
 if page == 1:
-    if st.button("Start Analysis", key="start_p1", use_container_width=True):
+    # if st.button("분석 시작", key="start_p1", use_container_width=True):
+
+    # 버튼 스타일 커스터마이징
+    st.markdown("""
+        <style>
+        div.stButton > button:first-child {
+            background-color: #FAEBC3	;
+            color: gray;
+            font-weight: bold;
+            font-size: 1.3em;
+            border-radius: 10px;
+            padding: 0.6em 1.2em;
+            border: 2px solid #FAEBC3;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    # 실제 버튼 + 클릭 이벤트
+    if st.button("분석 시작", key="start_p1", use_container_width=True):
+        # st.success("분석을 시작합니다!")
+
         go_to_page(2)
 elif page == 2:
     cols = st.columns(3)
@@ -463,12 +597,57 @@ elif page == 2:
         if st.button("< Back", key="back_p2", use_container_width=True): go_to_page(1)
     with cols[2]:
         if st.button("Next >", key="next_p3", use_container_width=True): go_to_page(3)
+
 elif page == 3:
+    # 1. page3.py의 user_info가 저장되었는지 확인
+    info_submitted = st.session_state.get('user_info') is not None
+
     cols = st.columns(3)
     with cols[0]:
-        if st.button("< Back", key="back_p3", use_container_width=True): go_to_page(2)
+        if st.button("< Back", key="back_p3", use_container_width=True):
+            st.session_state.user_info = None  # 뒤로 갈 때 요약 정보 초기화
+            go_to_page(2)
+
     with cols[2]:
-        if st.button("Get My Ergonomic Report", key="next_p4", use_container_width=True): go_to_page(4)
+        # 2. 상황에 따라 버튼 텍스트 변경
+        if info_submitted:
+            button_text = "인체공학 보고서 받기"  # 요약 화면일 때
+        else:
+            button_text = "입력 완료 (정보 확인)"  # 입력 화면일 때
+
+        # 3. 버튼 클릭 시 로직 분기
+        if st.button(button_text, key="next_p4", use_container_width=True):
+            if info_submitted:
+                # --- [동작 2] 요약 화면 -> 4페이지로 이동 ---
+
+                # 분석기가 사용할 'user_inputs'를 이 시점에 저장 (page4 호환성)
+                user_info = st.session_state.user_info
+                st.session_state.user_inputs = {
+                    "gender": 'female' if user_info.get('gender') == '여성' else 'male',
+                    "user_height_cm": user_info.get('height'),
+                    "handedness": user_info.get('dominant_hand')
+                }
+
+                go_to_page(4)
+            else:
+                # --- [동작 1] 입력 화면 -> 요약 화면으로 변경 ---
+
+                # 1. page3.py의 위젯(key)에서 현재 값을 직접 읽어오기
+                gender_val = st.session_state.get("gender_input", '여성')
+                height_val = st.session_state.get("height_input", 165)
+                hand_val = st.session_state.get("hand_input", '오른손')
+
+                # 2. 'user_info' 딕셔너리로 저장
+                st.session_state.user_info = {
+                    "gender": gender_val,
+                    "height": height_val,
+                    "dominant_hand": hand_val
+                }
+
+                # 3. 페이지를 다시 로드하여 page3.py가 요약 화면을 그리도록 함
+                st.rerun()
+
+
 
 elif page == 4:
     st.header("⏱️ 분석 중입니다...")
@@ -533,14 +712,11 @@ elif page == 4:
         st.stop()
 
 elif page == 5:
-    st.subheader("📊 당신을 위한 AI 인체공학 분석 리포트")
 
-    final_result = st.session_state.get('analysis_result', "분석 결과를 불러올 수 없습니다.")
-    st.markdown(final_result)
-    st.markdown("---")
+    # st.markdown("---")
 
     # --- [수정됨] 상세 분석 데이터를 한글로 번역하여 보여주는 UI ---
-    st.subheader("📋 상세 분석 데이터")
+    st.subheader("📋 분석 데이터")
     detailed_report = st.session_state.get('detailed_report', [])
 
     if not detailed_report:
@@ -562,6 +738,14 @@ elif page == 5:
                 # 상세 내용을 한글로 풀어 설명
                 details_korean = format_details_korean(problem_id, details)
                 st.markdown(f"세부 내용: {details_korean}")
+
+    st.markdown(" ")
+    st.markdown(" ")
+
+    st.subheader("📊 당신을 위한 AI 인체공학 분석 리포트")
+
+    final_result = st.session_state.get('analysis_result', "분석 결과를 불러올 수 없습니다.")
+    st.markdown(final_result)
 
     if st.button("다시 분석하기", key="retry_p5", use_container_width=True):
         handle_retry()
