@@ -101,7 +101,7 @@ def run_monitor_detection():
         screens = [obj for obj in detections if obj.get("class") in ["screen", "monitor", "laptop"]]
 
         if output_b64:
-            st.image(base64.b64decode(output_b64), caption="📊 Roboflow 시각화 결과", use_column_width=True)
+            st.image(base64.b64decode(output_b64), caption="📊 Roboflow 시각화 결과", use_container_width=True)
 
         if len(screens) > 0:
             draw_img = image.copy()
@@ -131,7 +131,7 @@ def run_monitor_detection():
                 )
                 draw.text((cx - text_w/2, cy - text_h/2), num, font=font, fill="white")
 
-            st.image(draw_img, caption="감지된 스크린 번호 표시", use_column_width=True)
+            st.image(draw_img, caption="감지된 스크린 번호 표시", use_container_width=True)
 
             if len(screens) > 1:
                 st.warning(f"🖥️ 스크린이 {len(screens)}개 감지되었습니다. 메인 스크린을 선택해주세요.")
