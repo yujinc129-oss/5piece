@@ -101,7 +101,7 @@ def run_monitor_detection():
         screens = [obj for obj in detections if obj.get("class") in ["screen", "monitor", "laptop"]]
 
         if output_b64:
-            st.image(base64.b64decode(output_b64), caption="📊 Roboflow 시각화 결과", use_container_width=True)
+            st.image(base64.b64decode(output_b64), caption="📊 객체 탐지 결과", use_container_width=True)
 
         if len(screens) > 0:
             draw_img = image.copy()
